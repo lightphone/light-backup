@@ -9,7 +9,7 @@ class GoogleDriveRemoteBackupContractTest : RemoteBackupContractTest() {
         val token = googleDriveTestAccessToken()
         val rootFolderPath = uniqueTestRootFolderPath("light-backup-contract-tests")
         println("GoogleDriveRemoteBackupContractTest root folder: $rootFolderPath")
-        return GoogleDriveRemoteBackup(fakeGoogleTokenProvider(token), rootFolderPath)
+        return GoogleDriveRemoteBackup(fakeAccessTokenProvider(token), rootFolderPath)
     }
 
     // Tests resumable upload chunking unique to Drive
@@ -18,7 +18,7 @@ class GoogleDriveRemoteBackupContractTest : RemoteBackupContractTest() {
         // Use Drive's minimum chunk size (256k), default is 8MB
         val token = googleDriveTestAccessToken()
         val chunkedBackup = GoogleDriveRemoteBackup(
-            tokenProvider = fakeGoogleTokenProvider(token),
+            tokenProvider = fakeAccessTokenProvider(token),
             rootFolderPath = uniqueTestRootFolderPath("light-backup-contract-tests"),
             chunkSizeBytes = 256 * 1024,
         )

@@ -20,24 +20,17 @@ import io.ktor.http.isSuccess
 import io.ktor.http.parameters
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.io.files.Path
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.random.Random
-import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
-import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
@@ -80,7 +73,7 @@ private data class DriveErrorEnvelope(val error: DriveErrorBody? = null)
 // (nonstandard) use of HTTP 308 as an "upload not finished yet" signal rather than a real
 // redirect, and a client that auto-follows 308s will misinterpret it.
 class GoogleDriveRemoteBackup(
-    private val tokenProvider: GoogleTokenProvider,
+    private val tokenProvider: RemoteAccessTokenProvider,
     override val rootFolderPath: String,
     private val httpClient: HttpClient = HttpClient(CIO) {
         followRedirects = false
@@ -477,146 +470,6 @@ private sealed class ChunkPutOutcome {
     data class Fatal(val error: RemoteBackupError) : ChunkPutOutcome()
 }
 
-private fun Path.segments(): List<String> {
-    val names = mutableListOf<String>()
-    var current: Path? = this
-    while (current != null) {
-        if (current.name.isNotEmpty()) names += current.name
-        current = current.parent
-    }
-    return names.asReversed()
-}
-
 private fun escapeForDriveQuery(value: String): String =
     value.replace("\\", "\\\\").replace("'", "\\'")
 
-// InputStream.readNBytes(int) would do this directly, but it's API 33+ on Android and this module
-// targets minSdk 26 - read(ByteArray, Int, Int) has been available since API 1.
-private fun InputStream.readChunk(maxLength: Int): ByteArray {
-    val buffer = ByteArray(maxLength)
-    var totalRead = 0
-    while (totalRead < maxLength) {
-        val read = read(buffer, totalRead, maxLength - totalRead)
-        if (read == -1) break
-        totalRead += read
-    }
-    return if (totalRead == maxLength) buffer else buffer.copyOf(totalRead)
-}
-
-data class RefreshedAccessToken(val accessToken: String, val expiresAt: Instant)
-
-sealed class TokenRefreshOutcome {
-    data class Refreshed(val token: RefreshedAccessToken) : TokenRefreshOutcome()
-
-    // The refresh token itself is dead (OAuth invalid_grant - revoked, expired, or the user pulled
-    // access) rather than the request having merely failed. Retrying won't help; the caller should
-    // drop the stored credentials so it can detect "not linked" and prompt to relink.
-    data class InvalidGrant(val message: String) : TokenRefreshOutcome()
-
-    // Anything else - network failure, unexpected response shape, etc. Worth retrying later; the
-    // stored credentials are still presumed good.
-    data class Failed(val cause: Throwable) : TokenRefreshOutcome()
-}
-
-// Adapts OAuthTunnelClient.refreshToken's OAuthResult into the TokenRefreshOutcome shape
-// StoredGoogleTokenProvider expects, e.g.:
-// StoredGoogleTokenProvider(accountType, tokenStorage, refresh = oAuthTunnelClient::refreshAccessToken)
-suspend fun OAuthTunnelClient.refreshAccessToken(refreshToken: String): TokenRefreshOutcome {
-    val tokens = when (val result = refreshToken(refreshToken)) {
-        is OAuthResult.Failure -> {
-            return if (result.code == "invalid_grant") {
-                TokenRefreshOutcome.InvalidGrant(result.error)
-            } else {
-                TokenRefreshOutcome.Failed(IllegalStateException(result.error))
-            }
-        }
-        is OAuthResult.Success -> result.tokens.jsonObject
-    }
-
-    val accessToken = tokens["access_token"]?.jsonPrimitive?.contentOrNull
-    // expires_in is in seconds per the OAuth2 spec (RFC 6749 4.2.2).
-    val expiresInSeconds = tokens["expires_in"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
-    if (accessToken == null || expiresInSeconds == null) {
-        return TokenRefreshOutcome.Failed(IllegalStateException("missing or invalid refreshed token fields"))
-    }
-
-    return TokenRefreshOutcome.Refreshed(RefreshedAccessToken(accessToken, Clock.System.now() + expiresInSeconds.seconds))
-}
-
-interface GoogleTokenProvider {
-    // A currently-valid access token for this account, refreshing it first if it's expired (or
-    // close to it). Fails with RemoteBackupError.Unauthorized if no account is linked, or if the
-    // refresh itself fails.
-    suspend fun getAccessToken(): Result<String>
-
-    // Called after the API rejects a token as invalid despite it looking unexpired (e.g. it was
-    // revoked externally). Forces the next getAccessToken() call to refresh rather than trust
-    // the cache.
-    suspend fun invalidateAccessToken()
-}
-
-// How the actual refresh HTTP call happens (direct to the provider, proxied through a relay that
-// holds a client secret, etc.) is intentionally left to the caller - this class only owns caching
-// and deciding when a refresh is needed.
-class StoredGoogleTokenProvider(
-    private val accountType: String,
-    private val tokenStorage: TokenStorage,
-    private val refresh: suspend (refreshToken: String) -> TokenRefreshOutcome,
-) : GoogleTokenProvider {
-    // Refreshes are a network round trip plus a re-persist, and every concurrent Drive call needs
-    // a token - this mutex means concurrent callers during a refresh all await the one attempt
-    // rather than each firing their own.
-    private val mutex = Mutex()
-    private var cached: StoredOAuthTokens? = null
-    private var forceRefresh = false
-
-    override suspend fun getAccessToken(): Result<String> = mutex.withLock {
-        val stored = cached ?: tokenStorage.getOAuthDetails(accountType)
-        ?: return@withLock Result.failure(
-            RemoteBackupError.Unauthorized(IllegalStateException("no $accountType account linked")),
-        )
-        cached = stored
-
-        val expiringSoon = Clock.System.now() >= stored.expiresAt - EXPIRY_SKEW
-        if (!forceRefresh && !expiringSoon) {
-            return@withLock Result.success(stored.accessToken)
-        }
-
-        when (val outcome = refresh(stored.refreshToken)) {
-            is TokenRefreshOutcome.Refreshed -> {
-                val updated = stored.copy(
-                    accessToken = outcome.token.accessToken,
-                    expiresAt = outcome.token.expiresAt,
-                )
-                tokenStorage.saveOAuthDetails(
-                    accountType = accountType,
-                    accessToken = updated.accessToken,
-                    refreshToken = updated.refreshToken,
-                    expiresAt = updated.expiresAt,
-                    scope = updated.scope,
-                )
-                cached = updated
-                forceRefresh = false
-                Result.success(updated.accessToken)
-            }
-            is TokenRefreshOutcome.InvalidGrant -> {
-                // The refresh token is permanently dead - keeping it around would just mean every
-                // future call fails the same way, so drop it and let the caller detect "not linked".
-                tokenStorage.removeOAuthDetails(accountType)
-                cached = null
-                Result.failure(RemoteBackupError.Unauthorized(IllegalStateException(outcome.message)))
-            }
-            is TokenRefreshOutcome.Failed -> {
-                Result.failure(RemoteBackupError.Unauthorized(outcome.cause))
-            }
-        }
-    }
-
-    override suspend fun invalidateAccessToken() = mutex.withLock {
-        forceRefresh = true
-    }
-
-    private companion object {
-        val EXPIRY_SKEW = 2.minutes
-    }
-}

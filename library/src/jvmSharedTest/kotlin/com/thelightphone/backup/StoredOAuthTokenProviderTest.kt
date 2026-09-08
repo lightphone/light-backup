@@ -45,11 +45,11 @@ private fun expiredTokens() = StoredOAuthTokens(
     scope = "scope-a",
 )
 
-class StoredGoogleTokenProviderTest {
+class StoredOAuthTokenProviderTest {
     @Test
     fun expiredToken_refreshSucceeds_savesAndReturnsNewAccessToken() = runBlocking {
         val storage = FakeGoogleTokenStorage(expiredTokens())
-        val provider = StoredGoogleTokenProvider("google", storage) { refreshToken ->
+        val provider = StoredOAuthTokenProvider("google", storage) { refreshToken ->
             assertEquals("refresh-1", refreshToken)
             TokenRefreshOutcome.Refreshed(RefreshedAccessToken("new-access", Clock.System.now() + 60.minutes))
         }
@@ -65,7 +65,7 @@ class StoredGoogleTokenProviderTest {
     @Test
     fun expiredToken_refreshFailsTransiently_keepsStoredTokens() = runBlocking {
         val storage = FakeGoogleTokenStorage(expiredTokens())
-        val provider = StoredGoogleTokenProvider("google", storage) {
+        val provider = StoredOAuthTokenProvider("google", storage) {
             TokenRefreshOutcome.Failed(IllegalStateException("network blip"))
         }
 
@@ -79,7 +79,7 @@ class StoredGoogleTokenProviderTest {
     @Test
     fun expiredToken_refreshInvalidGrant_clearsStoredTokens() = runBlocking {
         val storage = FakeGoogleTokenStorage(expiredTokens())
-        val provider = StoredGoogleTokenProvider("google", storage) {
+        val provider = StoredOAuthTokenProvider("google", storage) {
             TokenRefreshOutcome.InvalidGrant("refresh token revoked")
         }
 
@@ -94,7 +94,7 @@ class StoredGoogleTokenProviderTest {
     fun noAccountLinked_failsWithoutCallingRefresh() = runBlocking {
         val storage = FakeGoogleTokenStorage(initial = null)
         var refreshCalled = false
-        val provider = StoredGoogleTokenProvider("google", storage) {
+        val provider = StoredOAuthTokenProvider("google", storage) {
             refreshCalled = true
             TokenRefreshOutcome.Failed(IllegalStateException("should not be called"))
         }

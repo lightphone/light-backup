@@ -46,6 +46,33 @@ interface RemoteBackup {
     val rootFolderPath: String
 }
 
+// Shared by every RemoteBackup implementation that models directories with kotlinx.io Path -
+// walks the .parent chain rather than string-splitting, so it works regardless of how the Path
+// was constructed (single string, nested Path(base, child) calls, etc.).
+internal fun Path.segments(): List<String> {
+    val names = mutableListOf<String>()
+    var current: Path? = this
+    while (current != null) {
+        if (current.name.isNotEmpty()) names += current.name
+        current = current.parent
+    }
+    return names.asReversed()
+}
+
+// InputStream.readNBytes(int) would do this directly, but it's API 33+ on Android and this module
+// targets minSdk 26 - read(ByteArray, Int, Int) has been available since API 1. Shared by every
+// RemoteBackup implementation that chunks uploads (GoogleDriveRemoteBackup, DropboxRemoteBackup).
+internal fun InputStream.readChunk(maxLength: Int): ByteArray {
+    val buffer = ByteArray(maxLength)
+    var totalRead = 0
+    while (totalRead < maxLength) {
+        val read = read(buffer, totalRead, maxLength - totalRead)
+        if (read == -1) break
+        totalRead += read
+    }
+    return if (totalRead == maxLength) buffer else buffer.copyOf(totalRead)
+}
+
 data class BackupPath(val localPath: Path, val label: String)
 
 interface BackupDataSource {

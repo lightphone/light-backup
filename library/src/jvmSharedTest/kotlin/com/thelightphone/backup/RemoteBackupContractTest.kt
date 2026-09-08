@@ -2,6 +2,8 @@ package com.thelightphone.backup
 
 import kotlinx.coroutines.runBlocking
 import kotlinx.io.files.Path
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import org.junit.Before
 import org.junit.Test
 import kotlin.test.assertEquals
@@ -68,11 +70,21 @@ abstract class RemoteBackupContractTest {
     fun getMostRecentBackupDate_afterWritingAMetaFile_reflectsItsCreationTime() = runBlocking {
         // RemoteBackup implementations only read from _meta - BackupRunner is what writes to it on
         // a successful run (see BackupRunnerContractTest) - this simulates that write directly to
-        // test getMostRecentBackupDate() in isolation.
+        // test getMostRecentBackupDate() in isolation. Content has to be a real BackupSummary
+        // (completedAt in particular) since getMostRecentBackupDate() reads that embedded
+        // timestamp rather than any provider-assigned file metadata.
         val before = Clock.System.now() - 1.minutes // clock skew tolerance
         val metaDirectory = Path(remoteBackup.rootFolderPath, META_FOLDER_NAME)
         remoteBackup.createDirectory(metaDirectory).getOrThrow()
-        remoteBackup.uploadFile(metaDirectory, "2026-09-04T00-00-00Z", "{}".byteInputStream()).getOrThrow()
+        val summary = Json.encodeToString(
+            BackupSummary(
+                directoryName = "2026-09-04T00-00-00Z",
+                filesBackedUp = 0,
+                paths = emptyList(),
+                completedAt = Clock.System.now().toString(),
+            ),
+        )
+        remoteBackup.uploadFile(metaDirectory, "2026-09-04T00-00-00Z", summary.byteInputStream()).getOrThrow()
 
         val mostRecent = remoteBackup.getMostRecentBackupDate().getOrThrow()
 
