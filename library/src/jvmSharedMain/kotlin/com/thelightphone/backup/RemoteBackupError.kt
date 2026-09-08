@@ -1,0 +1,26 @@
+package com.thelightphone.backup
+
+import kotlin.time.Duration
+
+sealed class RemoteBackupError(message: String, cause: Throwable? = null) : Exception(message, cause) {
+    // Credentials are missing, expired, or were rejected even after a refresh attempt. Caller
+    // should prompt the user to relink the account rather than retry.
+    class Unauthorized(cause: Throwable? = null) : RemoteBackupError("not authorized", cause)
+
+    // The remote account is out of storage space. Not retryable - the caller needs to free up
+    // space (or the user needs to switch accounts) before trying again.
+    class QuotaExceeded(cause: Throwable? = null) : RemoteBackupError("remote storage quota exceeded", cause)
+
+    // The provider asked us to slow down. retryAfter is how long it suggested waiting, if given.
+    class RateLimited(val retryAfter: Duration? = null, cause: Throwable? = null) :
+        RemoteBackupError("rate limited", cause)
+
+    // A path this call expected to already exist (e.g. uploadFile's target directory) wasn't found.
+    class NotFound(path: String, cause: Throwable? = null) : RemoteBackupError("not found: $path", cause)
+
+    // Ran out of retries against a transient condition: connection failures, timeouts, 5xx responses.
+    class Unavailable(cause: Throwable? = null) : RemoteBackupError("remote service unavailable", cause)
+
+    // A provider-specific error with no dedicated case above.
+    class Unknown(message: String, cause: Throwable? = null) : RemoteBackupError(message, cause)
+}
