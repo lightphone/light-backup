@@ -89,8 +89,6 @@ interface OAuthTunnelClient {
     fun newSpecForSessionId(sessionId: String): OAuthTunnelSpec
     suspend fun authenticate(spec: OAuthTunnelSpec): OAuthResult
 
-    // Success wraps the same token JSON authenticate() does, so callers (e.g.
-    // GoogleTokenProvider's refresh lambda) can treat the two the same.
     suspend fun refreshToken(refreshToken: String): OAuthResult
 }
 
@@ -268,7 +266,6 @@ class OneDriveOAuthTunnelClient(override val clientId: String, workerHost: Strin
     override val scope = "offline_access Files.ReadWrite"
 }
 
-// TODO
 class DropboxOAuthTunnelClient(override val clientId: String, workerHost: String)  : BaseOAuthTunnelClient(workerHost) {
     override val mode = TunnelMode.RELAY
     override val authEndpoint = "https://www.dropbox.com/oauth2/authorize"

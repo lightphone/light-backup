@@ -34,7 +34,7 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
-// API Wrapping mostly LLM'ed
+// API Wrapping mostly LLM'ed, reviewed by Guy
 private const val DRIVE_API = "https://www.googleapis.com/drive/v3"
 private const val DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3/files"
 private const val FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"

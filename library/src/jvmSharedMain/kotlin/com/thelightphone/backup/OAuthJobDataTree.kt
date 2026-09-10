@@ -40,9 +40,6 @@ class OAuthJobDataTree(
     private val tokenStorage: TokenStorage,
     jobScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 ) : CoroutineJobDataTree<OAuthResult>(jobScope) {
-    // The spec built in prepareJob() must be the exact one authenticate() uses in runJob() - its
-    // verifier/challenge pair is single-use, so recomputing it in runJob() would produce a
-    // different challenge than the one baked into the authUrl the caller was already sent to.
     private val pendingSpecs = ConcurrentHashMap<String, OAuthTunnelSpec>()
 
     override fun prepareRedirectUrl(jobId: String, path: Path, params: Map<String, String>): String? {

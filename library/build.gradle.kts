@@ -57,5 +57,9 @@ kotlin {
             implementation(libs.kotlin.test)
             implementation(libs.kotlin.testJunit)
         }
+
+        androidMain.dependencies {
+            implementation(libs.androidx.work.runtime)
+        }
     }
 }

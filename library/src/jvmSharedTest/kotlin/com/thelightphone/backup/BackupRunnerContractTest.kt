@@ -28,8 +28,8 @@ abstract class BackupRunnerContractTest {
     @Test
     fun run_backsUpEveryFileAndUploadsAVerifiableChecksumManifest() = runBlocking {
         val paths = listOf(
-            BackupPath(Path("dir1"), "dir1"),
-            BackupPath(Path("dir2"), "dir2"),
+            BackupPath("com.example", Path("dir1"), "dir1"),
+            BackupPath("com.example", Path("dir2"), "dir2"),
         )
         val dataSource = FakeBackupDataSource(paths, filesPerPath = 3)
         val runner = BackupRunner(remoteBackup, dataSource)
@@ -61,7 +61,7 @@ abstract class BackupRunnerContractTest {
 
     @Test
     fun run_withOneUnreadableFile_stillBacksUpTheRestAsPartial() = runBlocking {
-        val paths = listOf(BackupPath(Path("dir1"), "dir1"))
+        val paths = listOf(BackupPath("com.example", Path("dir1"), "dir1"))
         val dataSource = FakeBackupDataSource(paths, filesPerPath = 3, failingFile = "dir1-file2.txt")
         val runner = BackupRunner(remoteBackup, dataSource)
 
@@ -87,7 +87,7 @@ abstract class BackupRunnerContractTest {
 
     @Test
     fun secondRun_getsItsOwnDatedFolder_andGetMostRecentBackupDateAdvances() = runBlocking {
-        val dataSource = FakeBackupDataSource(listOf(BackupPath(Path("dir1"), "dir1")), filesPerPath = 1)
+        val dataSource = FakeBackupDataSource(listOf(BackupPath("com.example", Path("dir1"), "dir1")), filesPerPath = 1)
         val clock = FakeClock(Clock.System.now())
         val runner = BackupRunner(remoteBackup, dataSource, clock)
 

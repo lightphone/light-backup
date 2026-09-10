@@ -9,6 +9,7 @@ junit = "4.13.2"
 vanniktechMavenPublish = "0.35.0"
 toolmanager = "0.0.11-dirty"
 ktor = "3.4.2"
+androidxWork = "2.10.0"
 
 
 [libraries]
@@ -23,6 +24,7 @@ light-toolmanager-server = { module = "com.thelightphone.toolmanager:server", ve
 ktor-clientCore = { module = "io.ktor:ktor-client-core", version.ref = "ktor" }
 ktor-clientCio = { module = "io.ktor:ktor-client-cio", version.ref = "ktor" }
 ktor-clientWebsockets = { module = "io.ktor:ktor-client-websockets", version.ref = "ktor" }
+androidx-work-runtime = { module = "androidx.work:work-runtime-ktx", version.ref = "androidxWork" }
 
 [plugins]
 androidLibrary = { id = "com.android.library", version.ref = "agp" }

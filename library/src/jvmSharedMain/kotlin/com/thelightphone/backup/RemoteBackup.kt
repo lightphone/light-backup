@@ -13,11 +13,11 @@ enum class RemoteBackupProvider {
     Google, Dropbox, OneDrive
 }
 
-// Name of the folder directly under rootFolderPath where BackupRunner records one file per
-// successful run (named after that run's directory name) - see getMostRecentBackupDate below.
+// Name of the folder directly under rootFolderPath where BackupRunner records run summaries
 internal const val META_FOLDER_NAME = "_meta"
 
-// will need API wrappers for each RemoteBackupProvider
+// Everything needed from a cloud provider to allow backups
+// each provider will have an API wrapper that conforms
 interface RemoteBackup {
     // Used to determine what should be backed up during the current run.
     suspend fun getMostRecentBackupDate(): Result<Instant?>
@@ -46,9 +46,7 @@ interface RemoteBackup {
     val rootFolderPath: String
 }
 
-// Shared by every RemoteBackup implementation that models directories with kotlinx.io Path -
-// walks the .parent chain rather than string-splitting, so it works regardless of how the Path
-// was constructed (single string, nested Path(base, child) calls, etc.).
+// Shared by every RemoteBackup implementation that models directories with kotlinx.io Path
 internal fun Path.segments(): List<String> {
     val names = mutableListOf<String>()
     var current: Path? = this
@@ -59,9 +57,7 @@ internal fun Path.segments(): List<String> {
     return names.asReversed()
 }
 
-// InputStream.readNBytes(int) would do this directly, but it's API 33+ on Android and this module
-// targets minSdk 26 - read(ByteArray, Int, Int) has been available since API 1. Shared by every
-// RemoteBackup implementation that chunks uploads (GoogleDriveRemoteBackup, DropboxRemoteBackup).
+// Changed from InputStream.readNBytes(int) for Android SDK 26 compat
 internal fun InputStream.readChunk(maxLength: Int): ByteArray {
     val buffer = ByteArray(maxLength)
     var totalRead = 0
@@ -73,21 +69,18 @@ internal fun InputStream.readChunk(maxLength: Int): ByteArray {
     return if (totalRead == maxLength) buffer else buffer.copyOf(totalRead)
 }
 
-data class BackupPath(val localPath: Path, val label: String)
+data class BackupPath(val authority: String, val localPath: Path, val label: String)
 
 interface BackupDataSource {
     suspend fun getPathsToBackUp(): Result<List<BackupPath>>
     suspend fun getFilesToBackUpForPath(parent: Path, timeOfLastBackup: Instant): Result<List<Path>>
     suspend fun readFile(path: Path): Result<InputStream>
 
-    // SHA-256 hex digest of the file's current contents. Independent of readFile - implementations
-    // are free to compute this via their own read, or return an already-known value.
+    // SHA-256 hex digest of the file's current contents. Independent of readFile
     suspend fun hashForFile(path: Path): Result<String>
 }
 
 // Name of the per-leaf-directory manifest BackupRunner uploads alongside each path's files.
-// Standard `sha256sum` format ("<hex>  <filename>" per line), so it can be verified with
-// `sha256sum -c checksums.sha256` using nothing but coreutils.
 private const val CHECKSUM_MANIFEST_FILE_NAME = "checksums.sha256"
 
 private fun buildChecksumManifest(entries: List<Pair<String, String>>): ByteArray =
@@ -100,8 +93,7 @@ internal data class BackupSummary(
     val directoryName: String,
     val filesBackedUp: Int,
     val paths: List<String>,
-    // ISO-8601 (via Instant.toString()) rather than an Instant field - kotlin.time.Instant has no
-    // built-in kotlinx.serialization support.
+    // ISO-8601 (via Instant.toString())
     val completedAt: String,
 )
 
@@ -122,6 +114,9 @@ class BackupRunner(
     private val clock: Clock = Clock.System,
 ) {
     suspend fun run(todayDirectoryName: String): BackupResult {
+        // structure in backup root in cloud is
+        // tool-id/date/file.example
+        // where there is one date directory per backup
         val timeOfLastBackup = remoteBackup.getMostRecentBackupDate().getOrElse {
             return BackupResult.Failed(BackupFailure(FailureScope.Run, it))
         }
@@ -147,8 +142,7 @@ class BackupRunner(
             val files = dataSource
                 .getFilesToBackUpForPath(path.localPath, timeOfLastBackup ?: Instant.DISTANT_PAST)
                 .getOrElse {
-                    // Local listing failures are never fatal to the run (see isFatalToBackupRun) -
-                    // just move on to the next path.
+                    // Local listing failures are never fatal to the run (see isFatalToBackupRun)
                     failures += BackupFailure(FailureScope.Path(path.label), it)
                     continue
                 }

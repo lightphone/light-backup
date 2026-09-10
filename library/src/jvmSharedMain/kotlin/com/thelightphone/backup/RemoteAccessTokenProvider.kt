@@ -10,16 +10,14 @@ import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
-// Provider-agnostic access-token caching, shared by every RemoteBackup implementation
+// Provider-agnostic access-token caching
 
 interface RemoteAccessTokenProvider {
-    // A currently-valid access token for this account, refreshing it first if it's expired (or
-    // close to it). Fails with RemoteBackupError.Unauthorized if no account is linked, or if the
-    // refresh itself fails.
+    // A currently-valid access token for this account, refreshing it first if it's expired
     suspend fun getAccessToken(): Result<String>
 
-    // Called after the API rejects a token as invalid despite it looking unexpired (e.g. it was
-    // revoked externally). Forces the next getAccessToken() call to refresh rather than trust
+    // Called after the API rejects a token as invalid despite it looking unexpired
+    // Forces the next getAccessToken() call to refresh rather than trust
     // the cache.
     suspend fun invalidateAccessToken()
 }
@@ -30,18 +28,14 @@ sealed class TokenRefreshOutcome {
     data class Refreshed(val token: RefreshedAccessToken) : TokenRefreshOutcome()
 
     // The refresh token itself is dead (OAuth invalid_grant - revoked, expired, or the user pulled
-    // access) rather than the request having merely failed. Retrying won't help; the caller should
-    // drop the stored credentials so it can detect "not linked" and prompt to relink.
+    // access). Don't retry
     data class InvalidGrant(val message: String) : TokenRefreshOutcome()
 
-    // Anything else - network failure, unexpected response shape, etc. Worth retrying later; the
-    // stored credentials are still presumed good.
+    // Anything else - network failure, unexpected response shape, etc. Maybe retry
     data class Failed(val cause: Throwable) : TokenRefreshOutcome()
 }
 
 // Adapts OAuthTunnelClient.refreshToken's OAuthResult into the TokenRefreshOutcome shape
-// StoredOAuthTokenProvider expects, e.g.:
-// StoredOAuthTokenProvider(accountType, tokenStorage, refresh = oAuthTunnelClient::refreshAccessToken)
 suspend fun OAuthTunnelClient.refreshAccessToken(refreshToken: String): TokenRefreshOutcome {
     val tokens = when (val result = refreshToken(refreshToken)) {
         is OAuthResult.Failure -> {
@@ -64,10 +58,7 @@ suspend fun OAuthTunnelClient.refreshAccessToken(refreshToken: String): TokenRef
     return TokenRefreshOutcome.Refreshed(RefreshedAccessToken(accessToken, Clock.System.now() + expiresInSeconds.seconds))
 }
 
-// How the actual refresh HTTP call happens (direct to the provider, proxied through a relay that
-// holds a client secret, etc.) is intentionally left to the caller - this class only owns caching
-// and deciding when a refresh is needed. `accountType` is just a TokenStorage key (e.g. "google",
-// "dropbox") - one StoredOAuthTokenProvider instance per linked account.
+// Base class for token storage. Handles refreshing, just pass a lambda
 class StoredOAuthTokenProvider(
     private val accountType: String,
     private val tokenStorage: TokenStorage,

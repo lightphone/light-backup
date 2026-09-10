@@ -1,17 +1,16 @@
 package com.thelightphone.backup
 
 sealed class FailureScope {
-    // A run-wide setup step: listing paths to back up, looking up the last backup date, or
-    // creating this run's root directory. Nothing was backed up.
+    // A run-wide setup step failed, nothing was backed up
     data object Run : FailureScope()
 
-    // Everything under one BackupPath: creating its subdirectory, or listing its files.
+    // Everything under one BackupPath failed, nothing was backed up for it
     data class Path(val label: String) : FailureScope()
 
-    // One specific file: reading it locally, or uploading it.
+    // One specific file failed to read or upload
     data class File(val label: String, val fileName: String) : FailureScope()
 
-    // Writing the _meta summary for an otherwise fully-successful run.
+    // Writing the _meta summary for an otherwise successful run.
     data object Summary : FailureScope()
 }
 
@@ -34,5 +33,13 @@ sealed class BackupResult {
 
 // Bad auth and no remote storage space left affect every subsequent call, so
 // no point continuing
-internal fun Throwable.isFatalToBackupRun(): Boolean =
-    this is RemoteBackupError.Unauthorized || this is RemoteBackupError.QuotaExceeded
+internal fun Throwable.isFatalToBackupRun(): Boolean = (this as? RemoteBackupError)?.let {
+    when (it) {
+        is RemoteBackupError.QuotaExceeded, is RemoteBackupError.Unauthorized -> true
+        is RemoteBackupError.NotFound,
+        is RemoteBackupError.RateLimited,
+        is RemoteBackupError.Unavailable,
+        is RemoteBackupError.Unknown -> false
+    }
+} ?: false
+

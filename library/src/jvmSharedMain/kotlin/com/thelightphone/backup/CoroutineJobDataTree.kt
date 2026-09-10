@@ -37,8 +37,6 @@ abstract class CoroutineJobDataTree<T>(
     ): Result<JobStart> {
         val jobId = jobTracker.startPending()
         val redirectUrl = prepareRedirectUrl(jobId, path, params)
-        // Launched in jobScope, not awaited here - startJob must return with the redirectUrl
-        // right away, well before the caller has done whatever it is redirectUrl points at.
         val job = jobScope.launch {
             processResult(path, jobId, runJob(jobId))
         }
@@ -63,13 +61,10 @@ abstract class CoroutineJobDataTree<T>(
     protected abstract suspend fun consumeResult(result: T): Result<JobResult>
 
     private suspend fun processResult(path: Path, jobId: String, result: T) {
-        // Only clear the path's active-job slot if it's still this job - a newer job may have
-        // already superseded it and taken the slot by the time this result comes back.
+        // Only clear the path's active-job slot if it's still this job
         activeJobs.compute(path) { _, current -> if (current?.first == jobId) null else current }
 
         // The job may have already been superseded (and marked failed) by a newer startJob() call
-        // at this path while runJob() was in flight - skip consumeResult's side effects (e.g.
-        // persisting something) rather than racing that supersession.
         if (jobTracker.status(jobId) !is JobStatus.Running) return
 
         consumeResult(result).fold(
