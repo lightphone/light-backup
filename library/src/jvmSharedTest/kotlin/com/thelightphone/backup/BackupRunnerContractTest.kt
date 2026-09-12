@@ -14,6 +14,22 @@ import kotlin.time.Clock
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
+// Prints the full failure/cause chain for a BackupResult - assertIs<...> only reports the runtime
+// class on mismatch (e.g. "actual <class BackupResult$Failed>"), not what's actually inside it, so
+// this is here purely to diagnose real-provider contract test failures.
+private fun logResult(label: String, result: BackupResult) {
+    println("[$label] result = $result")
+    val failures = when (result) {
+        is BackupResult.Failed -> listOf(result.cause)
+        is BackupResult.Partial -> result.failures + listOfNotNull(result.abortedBy)
+        is BackupResult.Completed -> emptyList()
+    }
+    for (failure in failures) {
+        println("[$label] failure scope=${failure.scope}")
+        failure.cause.printStackTrace()
+    }
+}
+
 // Extend/Implement for each provider
 abstract class BackupRunnerContractTest {
     protected abstract fun createRemoteBackup(): RemoteBackup
@@ -35,6 +51,7 @@ abstract class BackupRunnerContractTest {
         val runner = BackupRunner(remoteBackup, dataSource)
 
         val result = runner.run("run-1")
+        logResult("run-1", result)
 
         assertIs<BackupResult.Completed>(result)
         assertEquals(6, result.filesBackedUp)
@@ -54,9 +71,11 @@ abstract class BackupRunnerContractTest {
             "expected manifest to contain \"$expectedHash  dir1-file1.txt\", got:\n$manifest",
         )
 
-        // completed, should have _meta entry
-        val metaFiles = remoteBackup.listFiles(Path(remoteBackup.rootFolderPath, META_FOLDER_NAME)).getOrThrow()
-        assertTrue("run-1" in metaFiles, "expected a _meta/run-1 entry, got $metaFiles")
+        // completed, should have a _meta entry filed under dir1's own folder (not a shared one)
+        val dir1MetaFiles = remoteBackup
+            .listFiles(Path(Path(remoteBackup.rootFolderPath, "dir1"), META_FOLDER_NAME))
+            .getOrThrow()
+        assertEquals(1, dir1MetaFiles.size, "expected exactly one dir1/_meta entry, got $dir1MetaFiles")
     }
 
     @Test
@@ -66,6 +85,7 @@ abstract class BackupRunnerContractTest {
         val runner = BackupRunner(remoteBackup, dataSource)
 
         val result = runner.run("run-partial")
+        logResult("run-partial", result)
 
         assertIs<BackupResult.Partial>(result)
         assertEquals(2, result.filesBackedUp)
@@ -79,11 +99,13 @@ abstract class BackupRunnerContractTest {
         assertTrue("dir1-file3.txt" in files)
         assertTrue("dir1-file2.txt" !in files)
 
-        // dir1 still made partial progress (2 of 3 files), so it must be credited in _meta -
-        // otherwise a retry would re-upload dir1-file1.txt and dir1-file3.txt from scratch.
-        val metaFiles = remoteBackup.listFiles(Path(remoteBackup.rootFolderPath, META_FOLDER_NAME))
+        // dir1 still made partial progress (2 of 3 files), so it must be credited in its own
+        // _meta folder - otherwise a retry would re-upload dir1-file1.txt and dir1-file3.txt from
+        // scratch.
+        val dir1MetaFiles = remoteBackup
+            .listFiles(Path(Path(remoteBackup.rootFolderPath, "dir1"), META_FOLDER_NAME))
             .getOrElse { if (it is RemoteBackupError.NotFound) emptyList() else throw it }
-        assertTrue("run-partial" in metaFiles, "expected a _meta/run-partial entry, got $metaFiles")
+        assertEquals(1, dir1MetaFiles.size, "expected exactly one dir1/_meta entry, got $dir1MetaFiles")
 
         val mostRecent = remoteBackup.getMostRecentBackupDates().getOrThrow()
         assertNotNull(mostRecent["dir1"])
@@ -100,6 +122,7 @@ abstract class BackupRunnerContractTest {
         val runner = BackupRunner(remoteBackup, dataSource)
 
         val result = runner.run("run-nothing-for-dir2")
+        logResult("run-nothing-for-dir2", result)
 
         assertIs<BackupResult.Completed>(result)
         assertEquals(1, result.filesBackedUp)
@@ -115,12 +138,16 @@ abstract class BackupRunnerContractTest {
         val clock = FakeClock(Clock.System.now())
         val runner = BackupRunner(remoteBackup, dataSource, clock)
 
-        assertIs<BackupResult.Completed>(runner.run("run-a"))
+        val resultA = runner.run("run-a")
+        logResult("run-a", resultA)
+        assertIs<BackupResult.Completed>(resultA)
         val afterFirst = remoteBackup.getMostRecentBackupDates().getOrThrow()["dir1"]
 
         clock.now += 1.seconds
 
-        assertIs<BackupResult.Completed>(runner.run("run-b"))
+        val resultB = runner.run("run-b")
+        logResult("run-b", resultB)
+        assertIs<BackupResult.Completed>(resultB)
         val afterSecond = remoteBackup.getMostRecentBackupDates().getOrThrow()["dir1"]
 
         assertTrue(afterSecond!! > afterFirst!!, "expected $afterSecond to be after $afterFirst")
@@ -131,6 +158,13 @@ abstract class BackupRunnerContractTest {
         val dir1Subfolders = remoteBackup.listSubdirectories(Path(remoteBackup.rootFolderPath, "dir1")).getOrThrow()
         assertTrue("run-a" in dir1Subfolders)
         assertTrue("run-b" in dir1Subfolders)
+
+        // Each run wrote its own dir1/_meta entry, named after its own completedAt - not a shared
+        // file keyed by directory name.
+        val dir1MetaFiles = remoteBackup
+            .listFiles(Path(Path(remoteBackup.rootFolderPath, "dir1"), META_FOLDER_NAME))
+            .getOrThrow()
+        assertEquals(2, dir1MetaFiles.size, "expected two dir1/_meta entries, got $dir1MetaFiles")
     }
 }
 

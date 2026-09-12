@@ -93,52 +93,45 @@ class GoogleDriveRemoteBackup(
     private val folderIdCache = ConcurrentHashMap<String, String>()
 
     override suspend fun getMostRecentBackupDates(): Result<Map<String, Instant>> {
-        // rootFolderPath/META_FOLDER_NAME are segment names (e.g. "Backups/_meta"), not Drive ids -
-        // resolve them the same way any other path segments would be. If either doesn't exist yet,
-        // no backup has ever completed successfully.
-        val metaId = resolveFolder(listOf(rootFolderPath, META_FOLDER_NAME), createIfMissing = false)
-            .getOrElse { error ->
-                return if (error is RemoteBackupError.NotFound) Result.success(emptyMap()) else Result.failure(error)
-            }
+        // Each backed-up path is its own top-level folder under rootFolderPath (see BackupRunner) -
+        // list those rather than assuming any particular set of labels, since this call has no
+        // knowledge of what the current run's paths are.
+        val labels = listSubdirectories(Path(rootFolderPath)).getOrElse { error ->
+            return if (error is RemoteBackupError.NotFound) Result.success(emptyMap()) else Result.failure(error)
+        }
 
-        val response = apiRequest(HttpMethod.Get, "$DRIVE_API/files") {
-            url {
-                parameters.append(
-                    "q",
-                    "'$metaId' in parents and mimeType != '$FOLDER_MIME_TYPE' and trashed = false",
-                )
-                parameters.append("fields", "files(id,name)")
-                parameters.append("pageSize", "1000")
-            }
-        }.getOrElse { return Result.failure(it) }
-
-        val fileIds = parseBody<DriveFileList>(response).files.map { it.id }
-        if (fileIds.isEmpty()) return Result.success(emptyMap())
-
-        // completedAt is embedded in each _meta file's content by BackupRunner (see
-        // RemoteBackup.getMostRecentBackupDates() for why) rather than read off Drive's own
-        // createdTime - so unlike the old orderBy=createdTime/pageSize=1 query, every _meta file
-        // has to actually be fetched and compared. Each summary's `paths` lists the labels that
-        // made progress in that run, so the max completedAt is tracked per label rather than once
-        // overall.
         val mostRecentByLabel = mutableMapOf<String, Instant>()
-        for (fileId in fileIds) {
-            val contentResponse = apiRequest(HttpMethod.Get, "$DRIVE_API/files/$fileId") {
-                url { parameters.append("alt", "media") }
+        for (label in labels) {
+            // rootFolderPath/label/META_FOLDER_NAME are segment names, not Drive ids - resolve them
+            // the same way any other path segments would be. Missing means this path has never
+            // completed a backup.
+            val metaId = resolveFolder(listOf(rootFolderPath, label, META_FOLDER_NAME), createIfMissing = false)
+                .getOrElse { error ->
+                    if (error is RemoteBackupError.NotFound) continue else return Result.failure(error)
+                }
+
+            // Meta filenames are chosen (see metaFileNameFor) so plain name ordering matches
+            // chronological ordering - asking Drive to sort server-side and hand back just the top
+            // result means this path's last-backup date costs one small query, not a listing plus a
+            // download per _meta file it has ever written.
+            val response = apiRequest(HttpMethod.Get, "$DRIVE_API/files") {
+                url {
+                    parameters.append(
+                        "q",
+                        "'$metaId' in parents and mimeType != '$FOLDER_MIME_TYPE' and trashed = false",
+                    )
+                    parameters.append("orderBy", "name desc")
+                    parameters.append("pageSize", "1")
+                    // DriveFile.id has no default, so it must stay in the field mask even though
+                    // this call only cares about name.
+                    parameters.append("fields", "files(id,name)")
+                }
             }.getOrElse { return Result.failure(it) }
 
-            val summary = runCatching { parseBody<BackupSummary>(contentResponse) }
-                .getOrElse {
-                    return Result.failure(RemoteBackupError.Unknown("unparsable _meta content for file $fileId", it))
-                }
-            val completedAt = runCatching { Instant.parse(summary.completedAt) }
-                .getOrElse {
-                    return Result.failure(RemoteBackupError.Unknown("unparsable _meta content for file $fileId", it))
-                }
-            for (label in summary.paths) {
-                val current = mostRecentByLabel[label]
-                if (current == null || completedAt > current) mostRecentByLabel[label] = completedAt
-            }
+            val latestName = parseBody<DriveFileList>(response).files.firstOrNull()?.name ?: continue
+            val completedAt = parseMetaFileName(latestName)
+                ?: return Result.failure(RemoteBackupError.Unknown("unparsable _meta file name for $label: $latestName"))
+            mostRecentByLabel[label] = completedAt
         }
         return Result.success(mostRecentByLabel)
     }

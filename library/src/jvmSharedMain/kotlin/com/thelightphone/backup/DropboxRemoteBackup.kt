@@ -98,33 +98,28 @@ class DropboxRemoteBackup(
     private val json = Json { ignoreUnknownKeys = true }
 
     override suspend fun getMostRecentBackupDates(): Result<Map<String, Instant>> {
-        val metaPath = Path(rootFolderPath, META_FOLDER_NAME).toDropboxPath()
-        val fileNames = listChildren(metaPath, tag = "file").getOrElse { error ->
+        // Each backed-up path is its own top-level folder under rootFolderPath (see BackupRunner) -
+        // list those rather than assuming any particular set of labels, since this call has no
+        // knowledge of what the current run's paths are.
+        val labels = listSubdirectories(Path(rootFolderPath)).getOrElse { error ->
             return if (error is RemoteBackupError.NotFound) Result.success(emptyMap()) else Result.failure(error)
         }
-        if (fileNames.isEmpty()) return Result.success(emptyMap())
 
-        // completedAt is embedded in each _meta file's content by BackupRunner (see
-        // RemoteBackup.getMostRecentBackupDates() for why), so unlike a directory listing sorted by
-        // provider metadata, every _meta file actually has to be fetched and compared. Each
-        // summary's `paths` lists the labels that made progress in that run, so the max
-        // completedAt is tracked per label rather than once overall.
         val mostRecentByLabel = mutableMapOf<String, Instant>()
-        for (fileName in fileNames) {
-            val filePath = if (metaPath.isEmpty()) "/$fileName" else "$metaPath/$fileName"
-            val content = downloadContent(filePath).getOrElse { return Result.failure(it) }
-            val summary = runCatching { json.decodeFromString<BackupSummary>(content.decodeToString()) }
-                .getOrElse {
-                    return Result.failure(RemoteBackupError.Unknown("unparsable _meta content for $filePath", it))
-                }
-            val completedAt = runCatching { Instant.parse(summary.completedAt) }
-                .getOrElse {
-                    return Result.failure(RemoteBackupError.Unknown("unparsable _meta content for $filePath", it))
-                }
-            for (label in summary.paths) {
-                val current = mostRecentByLabel[label]
-                if (current == null || completedAt > current) mostRecentByLabel[label] = completedAt
+        for (label in labels) {
+            val metaPath = Path(Path(rootFolderPath, label), META_FOLDER_NAME).toDropboxPath()
+            // Dropbox's list_folder has no server-side sort/limit like Drive's orderBy - but this
+            // list is scoped to one path's own _meta folder now, and (unlike before) nothing gets
+            // downloaded: meta filenames are chosen (see metaFileNameFor) so plain name ordering
+            // matches chronological ordering, so the max name is this path's last-backup date.
+            val fileNames = listChildren(metaPath, tag = "file").getOrElse { error ->
+                if (error is RemoteBackupError.NotFound) continue else return Result.failure(error)
             }
+
+            val latestName = fileNames.maxOrNull() ?: continue
+            val completedAt = parseMetaFileName(latestName)
+                ?: return Result.failure(RemoteBackupError.Unknown("unparsable _meta file name for $label: $latestName"))
+            mostRecentByLabel[label] = completedAt
         }
         return Result.success(mostRecentByLabel)
     }

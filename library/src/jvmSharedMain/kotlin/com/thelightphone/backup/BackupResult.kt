@@ -9,9 +9,6 @@ sealed class FailureScope {
 
     // One specific file failed to read or upload
     data class File(val label: String, val fileName: String) : FailureScope()
-
-    // Writing the _meta summary for a run that backed up at least one path.
-    data object Summary : FailureScope()
 }
 
 data class BackupFailure(val scope: FailureScope, val cause: Throwable)

@@ -67,24 +67,25 @@ abstract class RemoteBackupContractTest {
     }
 
     @Test
-    fun getMostRecentBackupDates_afterWritingAMetaFile_reflectsItsCreationTimePerLabel() = runBlocking {
-        // RemoteBackup implementations only read from _meta - BackupRunner is what writes to it on
-        // a successful run (see BackupRunnerContractTest) - this simulates that write directly to
-        // test getMostRecentBackupDates() in isolation. Content has to be a real BackupSummary
-        // (completedAt and paths in particular) since getMostRecentBackupDates() reads those
-        // embedded fields rather than any provider-assigned file metadata.
+    fun getMostRecentBackupDates_afterWritingAMetaFile_reflectsItsFileNamePerLabel() = runBlocking {
+        // RemoteBackup implementations determine a path's last-backup time purely from the name of
+        // the newest file in that path's own _meta subfolder (see metaFileNameFor/
+        // parseMetaFileName) - BackupRunner is what writes an entry there on a successful run (see
+        // BackupRunnerContractTest) - this simulates that write directly to test
+        // getMostRecentBackupDates() in isolation. Content is never read back, so any valid
+        // BackupSummary works.
         val before = Clock.System.now() - 1.minutes // clock skew tolerance
-        val metaDirectory = Path(remoteBackup.rootFolderPath, META_FOLDER_NAME)
+        val completedAt = Clock.System.now()
+        val metaDirectory = Path(Path(remoteBackup.rootFolderPath, "dir1"), META_FOLDER_NAME)
         remoteBackup.createDirectory(metaDirectory).getOrThrow()
         val summary = Json.encodeToString(
             BackupSummary(
                 directoryName = "2026-09-04T00-00-00Z",
                 filesBackedUp = 1,
-                paths = listOf("dir1"),
-                completedAt = Clock.System.now().toString(),
+                completedAt = completedAt.toString(),
             ),
         )
-        remoteBackup.uploadFile(metaDirectory, "2026-09-04T00-00-00Z", summary.byteInputStream()).getOrThrow()
+        remoteBackup.uploadFile(metaDirectory, metaFileNameFor(completedAt), summary.byteInputStream()).getOrThrow()
 
         val mostRecent = remoteBackup.getMostRecentBackupDates().getOrThrow()
 
