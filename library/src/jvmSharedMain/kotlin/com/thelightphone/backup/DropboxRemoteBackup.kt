@@ -97,29 +97,31 @@ class DropboxRemoteBackup(
 ) : RemoteBackup {
     private val json = Json { ignoreUnknownKeys = true }
 
-    override suspend fun getMostRecentBackupDate(): Result<Instant?> {
-        val metaPath = Path(rootFolderPath, META_FOLDER_NAME).toDropboxPath()
-        val fileNames = listChildren(metaPath, tag = "file").getOrElse { error ->
-            return if (error is RemoteBackupError.NotFound) Result.success(null) else Result.failure(error)
+    override suspend fun getMostRecentBackupDates(): Result<Map<String, Instant>> {
+        // Each backed-up path is its own top-level folder under rootFolderPath (see BackupRunner) -
+        // list those rather than assuming any particular set of labels, since this call has no
+        // knowledge of what the current run's paths are.
+        val labels = listSubdirectories(Path(rootFolderPath)).getOrElse { error ->
+            return if (error is RemoteBackupError.NotFound) Result.success(emptyMap()) else Result.failure(error)
         }
-        if (fileNames.isEmpty()) return Result.success(null)
 
-        // completedAt is embedded in each _meta file's content by BackupRunner (see
-        // RemoteBackup.getMostRecentBackupDate() for why), so unlike a directory listing sorted by
-        // provider metadata, every _meta file actually has to be fetched and compared.
-        var mostRecent: Instant? = null
-        for (fileName in fileNames) {
-            val filePath = if (metaPath.isEmpty()) "/$fileName" else "$metaPath/$fileName"
-            val content = downloadContent(filePath).getOrElse { return Result.failure(it) }
-            val completedAt = runCatching {
-                Instant.parse(json.decodeFromString<BackupSummary>(content.decodeToString()).completedAt)
+        val mostRecentByLabel = mutableMapOf<String, Instant>()
+        for (label in labels) {
+            val metaPath = Path(Path(rootFolderPath, label), META_FOLDER_NAME).toDropboxPath()
+            // Dropbox's list_folder has no server-side sort/limit like Drive's orderBy - but this
+            // list is scoped to one path's own _meta folder now, and (unlike before) nothing gets
+            // downloaded: meta filenames are chosen (see metaFileNameFor) so plain name ordering
+            // matches chronological ordering, so the max name is this path's last-backup date.
+            val fileNames = listChildren(metaPath, tag = "file").getOrElse { error ->
+                if (error is RemoteBackupError.NotFound) continue else return Result.failure(error)
             }
-                .getOrElse {
-                    return Result.failure(RemoteBackupError.Unknown("unparsable _meta content for $filePath", it))
-                }
-            if (mostRecent == null || completedAt > mostRecent) mostRecent = completedAt
+
+            val latestName = fileNames.maxOrNull() ?: continue
+            val completedAt = parseMetaFileName(latestName)
+                ?: return Result.failure(RemoteBackupError.Unknown("unparsable _meta file name for $label: $latestName"))
+            mostRecentByLabel[label] = completedAt
         }
-        return Result.success(mostRecent)
+        return Result.success(mostRecentByLabel)
     }
 
     override suspend fun createDirectory(path: Path): Result<Unit> {

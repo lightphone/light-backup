@@ -6,21 +6,25 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.InputStream
 import java.io.OutputStream
+import kotlin.random.Random
 import kotlin.time.Clock
 import kotlin.time.Instant
 
 enum class RemoteBackupProvider {
-    Google, Dropbox, OneDrive
+    Custom, Google, Dropbox, OneDrive
 }
 
-// Name of the folder directly under rootFolderPath where BackupRunner records run summaries
+// Name of the subfolder inside each backed-up path's own folder (rootFolderPath/<label>/_meta)
+// where BackupRunner records one file per run that backed up at least one file for that path
 internal const val META_FOLDER_NAME = "_meta"
 
 // Everything needed from a cloud provider to allow backups
 // each provider will have an API wrapper that conforms
 interface RemoteBackup {
-    // Used to determine what should be backed up during the current run.
-    suspend fun getMostRecentBackupDate(): Result<Instant?>
+    // Per-path last-successful-backup time, keyed by BackupPath.label, used to determine what
+    // should be backed up for each path during the current run. A label absent from the map means
+    // that path has never completed a backup.
+    suspend fun getMostRecentBackupDates(): Result<Map<String, Instant>>
 
     // Idempotent. Failure is a RemoteBackupError.
     suspend fun createDirectory(path: Path): Result<Unit>
@@ -86,13 +90,23 @@ private const val CHECKSUM_MANIFEST_FILE_NAME = "checksums.sha256"
 private fun buildChecksumManifest(entries: List<Pair<String, String>>): ByteArray =
     entries.joinToString(separator = "") { (fileName, hash) -> "$hash  $fileName\n" }.toByteArray(Charsets.UTF_8)
 
-// Visible package-wide (not just this file) so each RemoteBackup implementation's
-// getMostRecentBackupDate() can parse completedAt back out of a downloaded _meta file.
+private const val TIMESTAMP_LENGTH = 20 // "yyyy-MM-ddTHH-mm-ssZ"
+
+internal fun metaFileNameFor(instant: Instant): String {
+    val timestamp = Instant.fromEpochSeconds(instant.epochSeconds).toString().replace(':', '-')
+    val suffix = Random.nextBytes(4).joinToString("") { "%02x".format(it) }
+    return "$timestamp-$suffix"
+}
+
+internal fun parseMetaFileName(name: String): Instant? = runCatching {
+    val (datePart, timePart) = name.take(TIMESTAMP_LENGTH).split("T", limit = 2)
+    Instant.parse("${datePart}T${timePart.removeSuffix("Z").replace('-', ':')}Z")
+}.getOrNull()
+
 @Serializable
 internal data class BackupSummary(
     val directoryName: String,
     val filesBackedUp: Int,
-    val paths: List<String>,
     // ISO-8601 (via Instant.toString())
     val completedAt: String,
 )
@@ -102,10 +116,9 @@ private val summaryJson = Json { prettyPrint = true }
 private fun buildBackupSummary(
     directoryName: String,
     filesBackedUp: Int,
-    paths: List<String>,
     completedAt: Instant,
 ): ByteArray =
-    summaryJson.encodeToString(BackupSummary(directoryName, filesBackedUp, paths, completedAt.toString()))
+    summaryJson.encodeToString(BackupSummary(directoryName, filesBackedUp, completedAt.toString()))
         .toByteArray(Charsets.UTF_8)
 
 class BackupRunner(
@@ -117,7 +130,8 @@ class BackupRunner(
         // structure in backup root in cloud is
         // tool-id/date/file.example
         // where there is one date directory per backup
-        val timeOfLastBackup = remoteBackup.getMostRecentBackupDate().getOrElse {
+
+        val timesOfLastBackup = remoteBackup.getMostRecentBackupDates().getOrElse {
             return BackupResult.Failed(BackupFailure(FailureScope.Run, it))
         }
 
@@ -127,25 +141,29 @@ class BackupRunner(
 
         var filesBackedUp = 0
         val failures = mutableListOf<BackupFailure>()
-        val backedUpPathLabels = mutableListOf<String>()
 
         for (path in paths) {
-            val timeRemotePath = Path(Path(remoteBackup.rootFolderPath, path.label), todayDirectoryName)
-
-            remoteBackup.createDirectory(timeRemotePath).exceptionOrNull()?.let { cause ->
-                val failure = BackupFailure(FailureScope.Path(path.label), cause)
-                if (cause.isFatalToBackupRun()) return abort(filesBackedUp, failures, failure)
-                failures += failure
-                continue
-            }
-
+            val timeOfLastBackup = timesOfLastBackup[path.label] ?: Instant.DISTANT_PAST
             val files = dataSource
-                .getFilesToBackUpForPath(path.localPath, timeOfLastBackup ?: Instant.DISTANT_PAST)
+                .getFilesToBackUpForPath(path.localPath, timeOfLastBackup)
                 .getOrElse {
                     // Local listing failures are never fatal to the run (see isFatalToBackupRun)
                     failures += BackupFailure(FailureScope.Path(path.label), it)
                     continue
                 }
+
+            if (files.isEmpty()) continue
+
+            val timeRemotePath = Path(Path(remoteBackup.rootFolderPath, path.label), todayDirectoryName)
+
+            remoteBackup.createDirectory(timeRemotePath).exceptionOrNull()?.let { cause ->
+                val failure = BackupFailure(FailureScope.Path(path.label), cause)
+                if (cause.isFatalToBackupRun()) {
+                    return abort(filesBackedUp, failures, path.label, todayDirectoryName, 0, failure)
+                }
+                failures += failure
+                continue
+            }
 
             val checksums = mutableListOf<Pair<String, String>>()
             var pathFilesBackedUp = 0
@@ -158,7 +176,9 @@ class BackupRunner(
                 val uploadError = remoteBackup.uploadFile(timeRemotePath, file.name, data).exceptionOrNull()
                 if (uploadError != null) {
                     val failure = BackupFailure(FailureScope.File(path.label, file.name), uploadError)
-                    if (uploadError.isFatalToBackupRun()) return abort(filesBackedUp, failures, failure)
+                    if (uploadError.isFatalToBackupRun()) {
+                        return abort(filesBackedUp, failures, path.label, todayDirectoryName, pathFilesBackedUp, failure)
+                    }
                     failures += failure
                     continue
                 }
@@ -173,8 +193,6 @@ class BackupRunner(
                 )
             }
 
-            if (pathFilesBackedUp > 0) backedUpPathLabels += path.label
-
             if (checksums.isNotEmpty()) {
                 val manifest = buildChecksumManifest(checksums)
                 val manifestError = remoteBackup
@@ -182,17 +200,17 @@ class BackupRunner(
                     .exceptionOrNull()
                 if (manifestError != null) {
                     val failure = BackupFailure(FailureScope.Path(path.label), manifestError)
-                    if (manifestError.isFatalToBackupRun()) return abort(filesBackedUp, failures, failure)
+                    if (manifestError.isFatalToBackupRun()) {
+                        return abort(filesBackedUp, failures, path.label, todayDirectoryName, pathFilesBackedUp, failure)
+                    }
                     failures += failure
                 }
             }
-        }
 
-        // Only record a _meta entry (and so only advance getMostRecentBackupDate) when nothing at
-        // all failed.
-        if (failures.isEmpty()) {
-            writeMetaSummary(todayDirectoryName, filesBackedUp, backedUpPathLabels).exceptionOrNull()?.let {
-                failures += BackupFailure(FailureScope.Summary, it)
+            if (pathFilesBackedUp > 0) {
+                writeMetaEntry(path.label, todayDirectoryName, pathFilesBackedUp).exceptionOrNull()?.let {
+                    failures += BackupFailure(FailureScope.Path(path.label), it)
+                }
             }
         }
 
@@ -203,22 +221,34 @@ class BackupRunner(
         }
     }
 
-    private suspend fun writeMetaSummary(
-        todayDirectoryName: String,
-        filesBackedUp: Int,
-        pathLabels: List<String>,
-    ): Result<Unit> {
-        val metaDirectory = Path(remoteBackup.rootFolderPath, META_FOLDER_NAME)
+    // Writes one _meta entry recording that `label` backed up `filesBackedUp` files as of now -
+    // filed under that path's own _meta subfolder (rootFolderPath/label/_meta/<timestamp>
+    private suspend fun writeMetaEntry(label: String, directoryName: String, filesBackedUp: Int): Result<Unit> {
+        val metaDirectory = Path(Path(remoteBackup.rootFolderPath, label), META_FOLDER_NAME)
         remoteBackup.createDirectory(metaDirectory).getOrElse { return Result.failure(it) }
 
-        val summary = buildBackupSummary(todayDirectoryName, filesBackedUp, pathLabels, clock.now())
-        return remoteBackup.uploadFile(metaDirectory, todayDirectoryName, summary.inputStream())
+        val completedAt = clock.now()
+        val summary = buildBackupSummary(directoryName, filesBackedUp, completedAt)
+        return remoteBackup.uploadFile(metaDirectory, metaFileNameFor(completedAt), summary.inputStream())
     }
 
-    private fun abort(filesBackedUp: Int, failures: List<BackupFailure>, abortedBy: BackupFailure): BackupResult =
-        if (filesBackedUp == 0 && failures.isEmpty()) {
+    private suspend fun abort(
+        filesBackedUp: Int,
+        failures: MutableList<BackupFailure>,
+        inProgressLabel: String,
+        todayDirectoryName: String,
+        inProgressPathFilesBackedUp: Int,
+        abortedBy: BackupFailure,
+    ): BackupResult {
+        if (inProgressPathFilesBackedUp > 0) {
+            writeMetaEntry(inProgressLabel, todayDirectoryName, inProgressPathFilesBackedUp).exceptionOrNull()?.let {
+                failures += BackupFailure(FailureScope.Path(inProgressLabel), it)
+            }
+        }
+        return if (filesBackedUp == 0 && failures.isEmpty()) {
             BackupResult.Failed(abortedBy)
         } else {
             BackupResult.Partial(filesBackedUp, failures, abortedBy)
         }
+    }
 }

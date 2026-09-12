@@ -14,4 +14,6 @@ interface BackupDependencyProvider {
 
     // Root folder within the provider's storage that backups are written under.
     fun rootFolderPath(): String
+
+    fun buildCustomRemoteBackup(remoteAccessTokenProvider: RemoteAccessTokenProvider, rootFilePath: String): RemoteBackup? = null
 }

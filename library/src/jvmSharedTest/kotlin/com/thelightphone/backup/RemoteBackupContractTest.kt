@@ -59,37 +59,40 @@ abstract class RemoteBackupContractTest {
     }
 
     @Test
-    fun getMostRecentBackupDate_beforeAnyBackupExists_returnsNullNotAnError() = runBlocking {
-        val result = remoteBackup.getMostRecentBackupDate()
+    fun getMostRecentBackupDates_beforeAnyBackupExists_returnsEmptyMapNotAnError() = runBlocking {
+        val result = remoteBackup.getMostRecentBackupDates()
 
         assertTrue(result.isSuccess)
-        assertNull(result.getOrThrow())
+        assertTrue(result.getOrThrow().isEmpty())
     }
 
     @Test
-    fun getMostRecentBackupDate_afterWritingAMetaFile_reflectsItsCreationTime() = runBlocking {
-        // RemoteBackup implementations only read from _meta - BackupRunner is what writes to it on
-        // a successful run (see BackupRunnerContractTest) - this simulates that write directly to
-        // test getMostRecentBackupDate() in isolation. Content has to be a real BackupSummary
-        // (completedAt in particular) since getMostRecentBackupDate() reads that embedded
-        // timestamp rather than any provider-assigned file metadata.
+    fun getMostRecentBackupDates_afterWritingAMetaFile_reflectsItsFileNamePerLabel() = runBlocking {
+        // RemoteBackup implementations determine a path's last-backup time purely from the name of
+        // the newest file in that path's own _meta subfolder (see metaFileNameFor/
+        // parseMetaFileName) - BackupRunner is what writes an entry there on a successful run (see
+        // BackupRunnerContractTest) - this simulates that write directly to test
+        // getMostRecentBackupDates() in isolation. Content is never read back, so any valid
+        // BackupSummary works.
         val before = Clock.System.now() - 1.minutes // clock skew tolerance
-        val metaDirectory = Path(remoteBackup.rootFolderPath, META_FOLDER_NAME)
+        val completedAt = Clock.System.now()
+        val metaDirectory = Path(Path(remoteBackup.rootFolderPath, "dir1"), META_FOLDER_NAME)
         remoteBackup.createDirectory(metaDirectory).getOrThrow()
         val summary = Json.encodeToString(
             BackupSummary(
                 directoryName = "2026-09-04T00-00-00Z",
-                filesBackedUp = 0,
-                paths = emptyList(),
-                completedAt = Clock.System.now().toString(),
+                filesBackedUp = 1,
+                completedAt = completedAt.toString(),
             ),
         )
-        remoteBackup.uploadFile(metaDirectory, "2026-09-04T00-00-00Z", summary.byteInputStream()).getOrThrow()
+        remoteBackup.uploadFile(metaDirectory, metaFileNameFor(completedAt), summary.byteInputStream()).getOrThrow()
 
-        val mostRecent = remoteBackup.getMostRecentBackupDate().getOrThrow()
+        val mostRecent = remoteBackup.getMostRecentBackupDates().getOrThrow()
 
-        assertNotNull(mostRecent)
-        assertTrue(mostRecent >= before, "expected $mostRecent to be after $before")
+        val mostRecentForDir1 = mostRecent["dir1"]
+        assertNotNull(mostRecentForDir1)
+        assertTrue(mostRecentForDir1 >= before, "expected $mostRecentForDir1 to be after $before")
+        assertNull(mostRecent["dir2"])
     }
 
     @Test
