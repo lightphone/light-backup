@@ -14,22 +14,6 @@ import kotlin.time.Clock
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
-// Prints the full failure/cause chain for a BackupResult - assertIs<...> only reports the runtime
-// class on mismatch (e.g. "actual <class BackupResult$Failed>"), not what's actually inside it, so
-// this is here purely to diagnose real-provider contract test failures.
-private fun logResult(label: String, result: BackupResult) {
-    println("[$label] result = $result")
-    val failures = when (result) {
-        is BackupResult.Failed -> listOf(result.cause)
-        is BackupResult.Partial -> result.failures + listOfNotNull(result.abortedBy)
-        is BackupResult.Completed -> emptyList()
-    }
-    for (failure in failures) {
-        println("[$label] failure scope=${failure.scope}")
-        failure.cause.printStackTrace()
-    }
-}
-
 // Extend/Implement for each provider
 abstract class BackupRunnerContractTest {
     protected abstract fun createRemoteBackup(): RemoteBackup
@@ -51,7 +35,6 @@ abstract class BackupRunnerContractTest {
         val runner = BackupRunner(remoteBackup, dataSource)
 
         val result = runner.run("run-1")
-        logResult("run-1", result)
 
         assertIs<BackupResult.Completed>(result)
         assertEquals(6, result.filesBackedUp)
@@ -85,7 +68,6 @@ abstract class BackupRunnerContractTest {
         val runner = BackupRunner(remoteBackup, dataSource)
 
         val result = runner.run("run-partial")
-        logResult("run-partial", result)
 
         assertIs<BackupResult.Partial>(result)
         assertEquals(2, result.filesBackedUp)
@@ -122,7 +104,6 @@ abstract class BackupRunnerContractTest {
         val runner = BackupRunner(remoteBackup, dataSource)
 
         val result = runner.run("run-nothing-for-dir2")
-        logResult("run-nothing-for-dir2", result)
 
         assertIs<BackupResult.Completed>(result)
         assertEquals(1, result.filesBackedUp)
@@ -138,16 +119,12 @@ abstract class BackupRunnerContractTest {
         val clock = FakeClock(Clock.System.now())
         val runner = BackupRunner(remoteBackup, dataSource, clock)
 
-        val resultA = runner.run("run-a")
-        logResult("run-a", resultA)
-        assertIs<BackupResult.Completed>(resultA)
+        assertIs<BackupResult.Completed>(runner.run("run-a"))
         val afterFirst = remoteBackup.getMostRecentBackupDates().getOrThrow()["dir1"]
 
         clock.now += 1.seconds
 
-        val resultB = runner.run("run-b")
-        logResult("run-b", resultB)
-        assertIs<BackupResult.Completed>(resultB)
+        assertIs<BackupResult.Completed>(runner.run("run-b"))
         val afterSecond = remoteBackup.getMostRecentBackupDates().getOrThrow()["dir1"]
 
         assertTrue(afterSecond!! > afterFirst!!, "expected $afterSecond to be after $afterFirst")

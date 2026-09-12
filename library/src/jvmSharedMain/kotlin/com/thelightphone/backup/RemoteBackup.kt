@@ -152,8 +152,6 @@ class BackupRunner(
                     continue
                 }
 
-            // Nothing to do for this path this run - skip creating a directory for it so we don't
-            // leave an empty dated folder behind under path.label.
             if (files.isEmpty()) continue
 
             val timeRemotePath = Path(Path(remoteBackup.rootFolderPath, path.label), todayDirectoryName)
