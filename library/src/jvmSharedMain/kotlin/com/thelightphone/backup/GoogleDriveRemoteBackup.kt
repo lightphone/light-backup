@@ -92,13 +92,13 @@ class GoogleDriveRemoteBackup(
     // createDirectory("Backups/2026-09-04/<label>") calls only resolves "Backups/2026-09-04" once.
     private val folderIdCache = ConcurrentHashMap<String, String>()
 
-    override suspend fun getMostRecentBackupDate(): Result<Instant?> {
+    override suspend fun getMostRecentBackupDates(): Result<Map<String, Instant>> {
         // rootFolderPath/META_FOLDER_NAME are segment names (e.g. "Backups/_meta"), not Drive ids -
         // resolve them the same way any other path segments would be. If either doesn't exist yet,
         // no backup has ever completed successfully.
         val metaId = resolveFolder(listOf(rootFolderPath, META_FOLDER_NAME), createIfMissing = false)
             .getOrElse { error ->
-                return if (error is RemoteBackupError.NotFound) Result.success(null) else Result.failure(error)
+                return if (error is RemoteBackupError.NotFound) Result.success(emptyMap()) else Result.failure(error)
             }
 
         val response = apiRequest(HttpMethod.Get, "$DRIVE_API/files") {
@@ -113,25 +113,34 @@ class GoogleDriveRemoteBackup(
         }.getOrElse { return Result.failure(it) }
 
         val fileIds = parseBody<DriveFileList>(response).files.map { it.id }
-        if (fileIds.isEmpty()) return Result.success(null)
+        if (fileIds.isEmpty()) return Result.success(emptyMap())
 
         // completedAt is embedded in each _meta file's content by BackupRunner (see
-        // RemoteBackup.getMostRecentBackupDate() for why) rather than read off Drive's own
+        // RemoteBackup.getMostRecentBackupDates() for why) rather than read off Drive's own
         // createdTime - so unlike the old orderBy=createdTime/pageSize=1 query, every _meta file
-        // has to actually be fetched and compared.
-        var mostRecent: Instant? = null
+        // has to actually be fetched and compared. Each summary's `paths` lists the labels that
+        // made progress in that run, so the max completedAt is tracked per label rather than once
+        // overall.
+        val mostRecentByLabel = mutableMapOf<String, Instant>()
         for (fileId in fileIds) {
             val contentResponse = apiRequest(HttpMethod.Get, "$DRIVE_API/files/$fileId") {
                 url { parameters.append("alt", "media") }
             }.getOrElse { return Result.failure(it) }
 
-            val completedAt = runCatching { Instant.parse(parseBody<BackupSummary>(contentResponse).completedAt) }
+            val summary = runCatching { parseBody<BackupSummary>(contentResponse) }
                 .getOrElse {
                     return Result.failure(RemoteBackupError.Unknown("unparsable _meta content for file $fileId", it))
                 }
-            if (mostRecent == null || completedAt > mostRecent) mostRecent = completedAt
+            val completedAt = runCatching { Instant.parse(summary.completedAt) }
+                .getOrElse {
+                    return Result.failure(RemoteBackupError.Unknown("unparsable _meta content for file $fileId", it))
+                }
+            for (label in summary.paths) {
+                val current = mostRecentByLabel[label]
+                if (current == null || completedAt > current) mostRecentByLabel[label] = completedAt
+            }
         }
-        return Result.success(mostRecent)
+        return Result.success(mostRecentByLabel)
     }
 
     override suspend fun createDirectory(path: Path): Result<Unit> =

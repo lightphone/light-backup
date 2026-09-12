@@ -92,7 +92,7 @@ interface OAuthTunnelClient {
     suspend fun refreshToken(refreshToken: String): OAuthResult
 }
 
-sealed class BaseOAuthTunnelClient(private val workerHost: String) : OAuthTunnelClient {
+abstract class BaseOAuthTunnelClient(private val workerHost: String) : OAuthTunnelClient {
     private val redirectUri = "https://$workerHost/callback"
     private val client = HttpClient(CIO) { install(WebSockets) }
 

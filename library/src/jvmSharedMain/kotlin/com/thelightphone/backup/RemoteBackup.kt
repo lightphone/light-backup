@@ -10,7 +10,7 @@ import kotlin.time.Clock
 import kotlin.time.Instant
 
 enum class RemoteBackupProvider {
-    Google, Dropbox, OneDrive
+    Custom, Google, Dropbox, OneDrive
 }
 
 // Name of the folder directly under rootFolderPath where BackupRunner records run summaries
@@ -19,8 +19,12 @@ internal const val META_FOLDER_NAME = "_meta"
 // Everything needed from a cloud provider to allow backups
 // each provider will have an API wrapper that conforms
 interface RemoteBackup {
-    // Used to determine what should be backed up during the current run.
-    suspend fun getMostRecentBackupDate(): Result<Instant?>
+    // Per-path last-successful-backup time, keyed by BackupPath.label, used to determine what
+    // should be backed up for each path during the current run. A label absent from the map means
+    // that path has never completed a backup - callers should treat it like Instant.DISTANT_PAST.
+    // Keeping this per-path (rather than one date for the whole run) means a single misbehaving
+    // path doesn't force every other, already-succeeded path to be re-uploaded from scratch.
+    suspend fun getMostRecentBackupDates(): Result<Map<String, Instant>>
 
     // Idempotent. Failure is a RemoteBackupError.
     suspend fun createDirectory(path: Path): Result<Unit>
@@ -87,7 +91,8 @@ private fun buildChecksumManifest(entries: List<Pair<String, String>>): ByteArra
     entries.joinToString(separator = "") { (fileName, hash) -> "$hash  $fileName\n" }.toByteArray(Charsets.UTF_8)
 
 // Visible package-wide (not just this file) so each RemoteBackup implementation's
-// getMostRecentBackupDate() can parse completedAt back out of a downloaded _meta file.
+// getMostRecentBackupDates() can parse completedAt (and the per-run path labels) back out of a
+// downloaded _meta file.
 @Serializable
 internal data class BackupSummary(
     val directoryName: String,
@@ -117,7 +122,8 @@ class BackupRunner(
         // structure in backup root in cloud is
         // tool-id/date/file.example
         // where there is one date directory per backup
-        val timeOfLastBackup = remoteBackup.getMostRecentBackupDate().getOrElse {
+
+        val timesOfLastBackup = remoteBackup.getMostRecentBackupDates().getOrElse {
             return BackupResult.Failed(BackupFailure(FailureScope.Run, it))
         }
 
@@ -130,22 +136,29 @@ class BackupRunner(
         val backedUpPathLabels = mutableListOf<String>()
 
         for (path in paths) {
-            val timeRemotePath = Path(Path(remoteBackup.rootFolderPath, path.label), todayDirectoryName)
-
-            remoteBackup.createDirectory(timeRemotePath).exceptionOrNull()?.let { cause ->
-                val failure = BackupFailure(FailureScope.Path(path.label), cause)
-                if (cause.isFatalToBackupRun()) return abort(filesBackedUp, failures, failure)
-                failures += failure
-                continue
-            }
-
+            val timeOfLastBackup = timesOfLastBackup[path.label] ?: Instant.DISTANT_PAST
             val files = dataSource
-                .getFilesToBackUpForPath(path.localPath, timeOfLastBackup ?: Instant.DISTANT_PAST)
+                .getFilesToBackUpForPath(path.localPath, timeOfLastBackup)
                 .getOrElse {
                     // Local listing failures are never fatal to the run (see isFatalToBackupRun)
                     failures += BackupFailure(FailureScope.Path(path.label), it)
                     continue
                 }
+
+            // Nothing to do for this path this run - skip creating a directory for it so we don't
+            // leave an empty dated folder behind under path.label.
+            if (files.isEmpty()) continue
+
+            val timeRemotePath = Path(Path(remoteBackup.rootFolderPath, path.label), todayDirectoryName)
+
+            remoteBackup.createDirectory(timeRemotePath).exceptionOrNull()?.let { cause ->
+                val failure = BackupFailure(FailureScope.Path(path.label), cause)
+                if (cause.isFatalToBackupRun()) {
+                    return abort(filesBackedUp, failures, backedUpPathLabels, todayDirectoryName, failure)
+                }
+                failures += failure
+                continue
+            }
 
             val checksums = mutableListOf<Pair<String, String>>()
             var pathFilesBackedUp = 0
@@ -158,12 +171,18 @@ class BackupRunner(
                 val uploadError = remoteBackup.uploadFile(timeRemotePath, file.name, data).exceptionOrNull()
                 if (uploadError != null) {
                     val failure = BackupFailure(FailureScope.File(path.label, file.name), uploadError)
-                    if (uploadError.isFatalToBackupRun()) return abort(filesBackedUp, failures, failure)
+                    if (uploadError.isFatalToBackupRun()) {
+                        return abort(filesBackedUp, failures, backedUpPathLabels, todayDirectoryName, failure)
+                    }
                     failures += failure
                     continue
                 }
                 filesBackedUp++
                 pathFilesBackedUp++
+                // Recorded as soon as the first file lands (rather than after the whole path
+                // finishes) so an abort() partway through this path still credits the files that
+                // made it before the fatal error.
+                if (pathFilesBackedUp == 1) backedUpPathLabels += path.label
 
                 // The file is backed up either way at this point - a hash failure only means it
                 // won't be verifiable via the manifest, not that the upload itself is invalid.
@@ -173,8 +192,6 @@ class BackupRunner(
                 )
             }
 
-            if (pathFilesBackedUp > 0) backedUpPathLabels += path.label
-
             if (checksums.isNotEmpty()) {
                 val manifest = buildChecksumManifest(checksums)
                 val manifestError = remoteBackup
@@ -182,15 +199,18 @@ class BackupRunner(
                     .exceptionOrNull()
                 if (manifestError != null) {
                     val failure = BackupFailure(FailureScope.Path(path.label), manifestError)
-                    if (manifestError.isFatalToBackupRun()) return abort(filesBackedUp, failures, failure)
+                    if (manifestError.isFatalToBackupRun()) {
+                        return abort(filesBackedUp, failures, backedUpPathLabels, todayDirectoryName, failure)
+                    }
                     failures += failure
                 }
             }
         }
 
-        // Only record a _meta entry (and so only advance getMostRecentBackupDate) when nothing at
-        // all failed.
-        if (failures.isEmpty()) {
+        // Record a _meta entry covering exactly the paths that made progress this run, even if
+        // other paths failed - so a later run only re-attempts the paths that failed (or never
+        // ran) instead of re-uploading everything behind one shared timeOfLastBackup.
+        if (backedUpPathLabels.isNotEmpty()) {
             writeMetaSummary(todayDirectoryName, filesBackedUp, backedUpPathLabels).exceptionOrNull()?.let {
                 failures += BackupFailure(FailureScope.Summary, it)
             }
@@ -215,10 +235,24 @@ class BackupRunner(
         return remoteBackup.uploadFile(metaDirectory, todayDirectoryName, summary.inputStream())
     }
 
-    private fun abort(filesBackedUp: Int, failures: List<BackupFailure>, abortedBy: BackupFailure): BackupResult =
-        if (filesBackedUp == 0 && failures.isEmpty()) {
+    private suspend fun abort(
+        filesBackedUp: Int,
+        failures: MutableList<BackupFailure>,
+        backedUpPathLabels: List<String>,
+        todayDirectoryName: String,
+        abortedBy: BackupFailure,
+    ): BackupResult {
+        // Same as the happy-path exit: record whatever progress happened before the fatal error,
+        // so the next run doesn't redo it.
+        if (backedUpPathLabels.isNotEmpty()) {
+            writeMetaSummary(todayDirectoryName, filesBackedUp, backedUpPathLabels).exceptionOrNull()?.let {
+                failures += BackupFailure(FailureScope.Summary, it)
+            }
+        }
+        return if (filesBackedUp == 0 && failures.isEmpty()) {
             BackupResult.Failed(abortedBy)
         } else {
             BackupResult.Partial(filesBackedUp, failures, abortedBy)
         }
+    }
 }

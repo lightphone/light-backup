@@ -8,7 +8,7 @@ import java.io.IOException
 import java.io.InputStream
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
-import kotlin.test.assertNull
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.seconds
@@ -79,25 +79,49 @@ abstract class BackupRunnerContractTest {
         assertTrue("dir1-file3.txt" in files)
         assertTrue("dir1-file2.txt" !in files)
 
-        // partial run must NOT record a _meta entry
+        // dir1 still made partial progress (2 of 3 files), so it must be credited in _meta -
+        // otherwise a retry would re-upload dir1-file1.txt and dir1-file3.txt from scratch.
         val metaFiles = remoteBackup.listFiles(Path(remoteBackup.rootFolderPath, META_FOLDER_NAME))
             .getOrElse { if (it is RemoteBackupError.NotFound) emptyList() else throw it }
-        assertNull(metaFiles.find { it == "run-partial" })
+        assertTrue("run-partial" in metaFiles, "expected a _meta/run-partial entry, got $metaFiles")
+
+        val mostRecent = remoteBackup.getMostRecentBackupDates().getOrThrow()
+        assertNotNull(mostRecent["dir1"])
+        Unit
     }
 
     @Test
-    fun secondRun_getsItsOwnDatedFolder_andGetMostRecentBackupDateAdvances() = runBlocking {
+    fun run_withAPathThatHasNothingToBackUp_doesNotCreateAnEmptyDirectoryForIt() = runBlocking {
+        val paths = listOf(
+            BackupPath("com.example", Path("dir1"), "dir1"),
+            BackupPath("com.example", Path("dir2"), "dir2"),
+        )
+        val dataSource = FakeBackupDataSource(paths, filesPerPath = 1, emptyLabels = setOf("dir2"))
+        val runner = BackupRunner(remoteBackup, dataSource)
+
+        val result = runner.run("run-nothing-for-dir2")
+
+        assertIs<BackupResult.Completed>(result)
+        assertEquals(1, result.filesBackedUp)
+
+        val rootSubfolders = remoteBackup.listSubdirectories(Path(remoteBackup.rootFolderPath)).getOrThrow()
+        assertTrue("dir1" in rootSubfolders, "expected dir1 to be created since it had a file to back up")
+        assertTrue("dir2" !in rootSubfolders, "expected no dir2 folder since it had nothing to back up, got $rootSubfolders")
+    }
+
+    @Test
+    fun secondRun_getsItsOwnDatedFolder_andGetMostRecentBackupDatesAdvancesForThatLabel() = runBlocking {
         val dataSource = FakeBackupDataSource(listOf(BackupPath("com.example", Path("dir1"), "dir1")), filesPerPath = 1)
         val clock = FakeClock(Clock.System.now())
         val runner = BackupRunner(remoteBackup, dataSource, clock)
 
         assertIs<BackupResult.Completed>(runner.run("run-a"))
-        val afterFirst = remoteBackup.getMostRecentBackupDate().getOrThrow()
+        val afterFirst = remoteBackup.getMostRecentBackupDates().getOrThrow()["dir1"]
 
         clock.now += 1.seconds
 
         assertIs<BackupResult.Completed>(runner.run("run-b"))
-        val afterSecond = remoteBackup.getMostRecentBackupDate().getOrThrow()
+        val afterSecond = remoteBackup.getMostRecentBackupDates().getOrThrow()["dir1"]
 
         assertTrue(afterSecond!! > afterFirst!!, "expected $afterSecond to be after $afterFirst")
 
@@ -114,11 +138,15 @@ private class FakeBackupDataSource(
     private val paths: List<BackupPath>,
     private val filesPerPath: Int = 3,
     private val failingFile: String? = null,
+    // Labels that should report nothing left to back up, regardless of filesPerPath.
+    private val emptyLabels: Set<String> = emptySet(),
 ) : BackupDataSource {
     override suspend fun getPathsToBackUp(): Result<List<BackupPath>> = Result.success(paths)
 
-    override suspend fun getFilesToBackUpForPath(parent: Path, timeOfLastBackup: Instant): Result<List<Path>> =
-        Result.success((1..filesPerPath).map { Path("${parent.name}-file$it.txt") })
+    override suspend fun getFilesToBackUpForPath(parent: Path, timeOfLastBackup: Instant): Result<List<Path>> {
+        if (parent.name in emptyLabels) return Result.success(emptyList())
+        return Result.success((1..filesPerPath).map { Path("${parent.name}-file$it.txt") })
+    }
 
     override suspend fun readFile(path: Path): Result<InputStream> {
         if (path.name == failingFile) {

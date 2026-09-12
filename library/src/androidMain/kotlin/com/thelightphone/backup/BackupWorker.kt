@@ -49,10 +49,12 @@ class BackupWorker(
             preferences.setLastBackupStatus(BackupStatus.NeedsReauth)
             Result.failure()
         }
+
         is RemoteBackupError.QuotaExceeded -> {
             preferences.setLastBackupStatus(BackupStatus.QuotaExceeded)
             Result.failure()
         }
+
         else -> {
             preferences.setLastBackupStatus(BackupStatus.Failed(cause?.message ?: "backup failed"))
             Result.retry()
@@ -60,12 +62,16 @@ class BackupWorker(
     }
 
     private fun buildRemoteBackup(provider: RemoteBackupProvider): RemoteBackup? {
-        val tokenProvider = dependencyProvider.createTokenProvider(provider)
+        val tokenProvider = dependencyProvider.createTokenProvider(provider) ?: return null
         val rootFolderPath = dependencyProvider.rootFolderPath()
         return when (provider) {
             RemoteBackupProvider.Google -> GoogleDriveRemoteBackup(tokenProvider, rootFolderPath)
             RemoteBackupProvider.Dropbox -> DropboxRemoteBackup(tokenProvider, rootFolderPath)
             RemoteBackupProvider.OneDrive -> null // no RemoteBackup implementation yet
+            RemoteBackupProvider.Custom -> dependencyProvider.buildCustomRemoteBackup(
+                tokenProvider,
+                rootFolderPath
+            )
         }
     }
 }
@@ -90,7 +96,13 @@ class BackupWorkerFactory(
         workerClassName: String,
         workerParameters: WorkerParameters,
     ): ListenableWorker? = when (workerClassName) {
-        BackupWorker::class.java.name -> BackupWorker(appContext, workerParameters, preferences, dependencyProvider)
+        BackupWorker::class.java.name -> BackupWorker(
+            appContext,
+            workerParameters,
+            preferences,
+            dependencyProvider
+        )
+
         else -> null
     }
 }
@@ -122,7 +134,11 @@ object BackupScheduler {
             .build()
 
         WorkManager.getInstance(context)
-            .enqueueUniquePeriodicWork(PERIODIC_WORK_NAME, ExistingPeriodicWorkPolicy.UPDATE, request)
+            .enqueueUniquePeriodicWork(
+                PERIODIC_WORK_NAME,
+                ExistingPeriodicWorkPolicy.UPDATE,
+                request
+            )
     }
 
     fun cancel(context: Context) {
