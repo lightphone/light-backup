@@ -16,7 +16,6 @@ import androidx.work.WorkerParameters
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
-import kotlin.time.Instant
 import kotlin.time.toJavaDuration
 
 // Runs one BackupRunner pass
@@ -33,7 +32,7 @@ class BackupWorker(
         val remoteBackup = buildRemoteBackup(provider) ?: return Result.failure()
 
         val runner = BackupRunner(remoteBackup, dependencyProvider.createDataSource(), clock)
-        return when (val result = runner.run(todayDirectoryName(clock.now()))) {
+        return when (val result = runner.run()) {
             is BackupResult.Completed -> {
                 preferences.setLastBackupStatus(BackupStatus.Succeeded(clock.now()))
                 Result.success()
@@ -75,10 +74,6 @@ class BackupWorker(
         }
     }
 }
-
-// "yyyy-MM-ddTHH-mm-ssZ"
-private fun todayDirectoryName(now: Instant): String =
-    Instant.fromEpochSeconds(now.epochSeconds).toString().replace(":", "-")
 
 // use a worker factory:
 //   class App : Application(), Configuration.Provider {

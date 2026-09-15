@@ -8,6 +8,8 @@ import java.io.InputStream
 import java.io.OutputStream
 import kotlin.random.Random
 import kotlin.time.Clock
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.days
 import kotlin.time.Instant
 
 enum class RemoteBackupProvider {
@@ -77,11 +79,19 @@ data class BackupPath(val authority: String, val localPath: Path, val label: Str
 
 interface BackupDataSource {
     suspend fun getPathsToBackUp(): Result<List<BackupPath>>
-    suspend fun getFilesToBackUpForPath(parent: Path, timeOfLastBackup: Instant): Result<List<Path>>
+
+    // Files under parent that were created/modified within (lowerBound, upperBound] (and should be backed up)
+    suspend fun getFilesToBackUpForPath(parent: Path, lowerBound: Instant, upperBound: Instant): Result<List<Path>>
+
     suspend fun readFile(path: Path): Result<InputStream>
 
     // SHA-256 hex digest of the file's current contents. Independent of readFile
     suspend fun hashForFile(path: Path): Result<String>
+
+    // The earliest timestamp among files currently under parent that could ever need backing up
+    // (likely the oldest file's creation/modified time).
+    // BackupRunner uses this as the starting lower bound when a label has never completed a backup
+    suspend fun getEarliestPossibleBackupDate(parent: Path): Result<Instant>
 }
 
 // Name of the per-leaf-directory manifest BackupRunner uploads alongside each path's files.
@@ -92,8 +102,11 @@ private fun buildChecksumManifest(entries: List<Pair<String, String>>): ByteArra
 
 private const val TIMESTAMP_LENGTH = 20 // "yyyy-MM-ddTHH-mm-ssZ"
 
+// Precision for marking backups as successful
+internal fun Instant.truncatedToWholeSeconds(): Instant = Instant.fromEpochSeconds(epochSeconds)
+
 internal fun metaFileNameFor(instant: Instant): String {
-    val timestamp = Instant.fromEpochSeconds(instant.epochSeconds).toString().replace(':', '-')
+    val timestamp = instant.truncatedToWholeSeconds().toString().replace(':', '-')
     val suffix = Random.nextBytes(4).joinToString("") { "%02x".format(it) }
     return "$timestamp-$suffix"
 }
@@ -125,11 +138,15 @@ class BackupRunner(
     private val remoteBackup: RemoteBackup,
     private val dataSource: BackupDataSource,
     private val clock: Clock = Clock.System,
+    private val chunkDuration: Duration = 1.days,
 ) {
-    suspend fun run(todayDirectoryName: String): BackupResult {
+    suspend fun run(): BackupResult {
         // structure in backup root in cloud is
         // tool-id/date/file.example
-        // where there is one date directory per backup
+        // where there is one date directory per backup window
+
+        // Truncated so window boundaries line up exactly
+        val now = clock.now().truncatedToWholeSeconds()
 
         val timesOfLastBackup = remoteBackup.getMostRecentBackupDates().getOrElse {
             return BackupResult.Failed(BackupFailure(FailureScope.Run, it))
@@ -143,73 +160,89 @@ class BackupRunner(
         val failures = mutableListOf<BackupFailure>()
 
         for (path in paths) {
-            val timeOfLastBackup = timesOfLastBackup[path.label] ?: Instant.DISTANT_PAST
-            val files = dataSource
-                .getFilesToBackUpForPath(path.localPath, timeOfLastBackup)
+            val resumeFrom = timesOfLastBackup[path.label] ?: dataSource
+                .getEarliestPossibleBackupDate(path.localPath)
                 .getOrElse {
-                    // Local listing failures are never fatal to the run (see isFatalToBackupRun)
                     failures += BackupFailure(FailureScope.Path(path.label), it)
                     continue
                 }
 
-            if (files.isEmpty()) continue
+            for (window in chunkWindows(resumeFrom, now, chunkDuration)) {
+                val directoryName = backupDirectoryNameFor(window.upperBound)
 
-            val timeRemotePath = Path(Path(remoteBackup.rootFolderPath, path.label), todayDirectoryName)
+                val files = dataSource
+                    .getFilesToBackUpForPath(path.localPath, window.lowerBound, window.upperBound)
+                    .getOrElse {
+                        // Local listing failures are never fatal to the run (see isFatalToBackupRun)
+                        failures += BackupFailure(FailureScope.Path(path.label), it)
+                        continue
+                    }
 
-            remoteBackup.createDirectory(timeRemotePath).exceptionOrNull()?.let { cause ->
-                val failure = BackupFailure(FailureScope.Path(path.label), cause)
-                if (cause.isFatalToBackupRun()) {
-                    return abort(filesBackedUp, failures, path.label, todayDirectoryName, 0, failure)
-                }
-                failures += failure
-                continue
-            }
+                if (files.isEmpty()) continue
 
-            val checksums = mutableListOf<Pair<String, String>>()
-            var pathFilesBackedUp = 0
+                val windowRemotePath = Path(Path(remoteBackup.rootFolderPath, path.label), directoryName)
 
-            for (file in files) {
-                val data = dataSource.readFile(file).getOrElse {
-                    failures += BackupFailure(FailureScope.File(path.label, file.name), it)
-                    continue
-                }
-                val uploadError = remoteBackup.uploadFile(timeRemotePath, file.name, data).exceptionOrNull()
-                if (uploadError != null) {
-                    val failure = BackupFailure(FailureScope.File(path.label, file.name), uploadError)
-                    if (uploadError.isFatalToBackupRun()) {
-                        return abort(filesBackedUp, failures, path.label, todayDirectoryName, pathFilesBackedUp, failure)
+                remoteBackup.createDirectory(windowRemotePath).exceptionOrNull()?.let { cause ->
+                    val failure = BackupFailure(FailureScope.Path(path.label), cause)
+                    if (cause.isFatalToBackupRun()) {
+                        return abort(filesBackedUp, failures, path.label, directoryName, 0, window.upperBound, failure)
                     }
                     failures += failure
                     continue
                 }
-                filesBackedUp++
-                pathFilesBackedUp++
 
-                // The file is backed up either way at this point - a hash failure only means it
-                // won't be verifiable via the manifest, not that the upload itself is invalid.
-                dataSource.hashForFile(file).fold(
-                    onSuccess = { hash -> checksums += file.name to hash },
-                    onFailure = { failures += BackupFailure(FailureScope.File(path.label, file.name), it) },
-                )
-            }
+                val checksums = mutableListOf<Pair<String, String>>()
+                var windowFilesBackedUp = 0
 
-            if (checksums.isNotEmpty()) {
-                val manifest = buildChecksumManifest(checksums)
-                val manifestError = remoteBackup
-                    .uploadFile(timeRemotePath, CHECKSUM_MANIFEST_FILE_NAME, manifest.inputStream())
-                    .exceptionOrNull()
-                if (manifestError != null) {
-                    val failure = BackupFailure(FailureScope.Path(path.label), manifestError)
-                    if (manifestError.isFatalToBackupRun()) {
-                        return abort(filesBackedUp, failures, path.label, todayDirectoryName, pathFilesBackedUp, failure)
+                for (file in files) {
+                    val data = dataSource.readFile(file).getOrElse {
+                        failures += BackupFailure(FailureScope.File(path.label, file.name), it)
+                        continue
                     }
-                    failures += failure
-                }
-            }
+                    val uploadError = remoteBackup.uploadFile(windowRemotePath, file.name, data).exceptionOrNull()
+                    if (uploadError != null) {
+                        val failure = BackupFailure(FailureScope.File(path.label, file.name), uploadError)
+                        if (uploadError.isFatalToBackupRun()) {
+                            return abort(
+                                filesBackedUp, failures, path.label, directoryName,
+                                windowFilesBackedUp, window.upperBound, failure,
+                            )
+                        }
+                        failures += failure
+                        continue
+                    }
+                    filesBackedUp++
+                    windowFilesBackedUp++
 
-            if (pathFilesBackedUp > 0) {
-                writeMetaEntry(path.label, todayDirectoryName, pathFilesBackedUp).exceptionOrNull()?.let {
-                    failures += BackupFailure(FailureScope.Path(path.label), it)
+                    // The file is backed up either way at this point - a hash failure only means it
+                    // won't be verifiable via the manifest, not that the upload itself is invalid.
+                    dataSource.hashForFile(file).fold(
+                        onSuccess = { hash -> checksums += file.name to hash },
+                        onFailure = { failures += BackupFailure(FailureScope.File(path.label, file.name), it) },
+                    )
+                }
+
+                if (checksums.isNotEmpty()) {
+                    val manifest = buildChecksumManifest(checksums)
+                    val manifestError = remoteBackup
+                        .uploadFile(windowRemotePath, CHECKSUM_MANIFEST_FILE_NAME, manifest.inputStream())
+                        .exceptionOrNull()
+                    if (manifestError != null) {
+                        val failure = BackupFailure(FailureScope.Path(path.label), manifestError)
+                        if (manifestError.isFatalToBackupRun()) {
+                            return abort(
+                                filesBackedUp, failures, path.label, directoryName,
+                                windowFilesBackedUp, window.upperBound, failure,
+                            )
+                        }
+                        failures += failure
+                    }
+                }
+
+                if (windowFilesBackedUp > 0) {
+                    writeMetaEntry(path.label, directoryName, windowFilesBackedUp, window.upperBound).exceptionOrNull()?.let {
+                        failures += BackupFailure(FailureScope.Path(path.label), it)
+                    }
                 }
             }
         }
@@ -221,13 +254,16 @@ class BackupRunner(
         }
     }
 
-    // Writes one _meta entry recording that `label` backed up `filesBackedUp` files as of now -
-    // filed under that path's own _meta subfolder (rootFolderPath/label/_meta/<timestamp>
-    private suspend fun writeMetaEntry(label: String, directoryName: String, filesBackedUp: Int): Result<Unit> {
+    // Writes one _meta entry recording that `label` backed up `filesBackedUp` files as of completedAt
+    private suspend fun writeMetaEntry(
+        label: String,
+        directoryName: String,
+        filesBackedUp: Int,
+        completedAt: Instant,
+    ): Result<Unit> {
         val metaDirectory = Path(Path(remoteBackup.rootFolderPath, label), META_FOLDER_NAME)
         remoteBackup.createDirectory(metaDirectory).getOrElse { return Result.failure(it) }
 
-        val completedAt = clock.now()
         val summary = buildBackupSummary(directoryName, filesBackedUp, completedAt)
         return remoteBackup.uploadFile(metaDirectory, metaFileNameFor(completedAt), summary.inputStream())
     }
@@ -236,12 +272,13 @@ class BackupRunner(
         filesBackedUp: Int,
         failures: MutableList<BackupFailure>,
         inProgressLabel: String,
-        todayDirectoryName: String,
-        inProgressPathFilesBackedUp: Int,
+        directoryName: String,
+        inProgressWindowFilesBackedUp: Int,
+        completedAt: Instant,
         abortedBy: BackupFailure,
     ): BackupResult {
-        if (inProgressPathFilesBackedUp > 0) {
-            writeMetaEntry(inProgressLabel, todayDirectoryName, inProgressPathFilesBackedUp).exceptionOrNull()?.let {
+        if (inProgressWindowFilesBackedUp > 0) {
+            writeMetaEntry(inProgressLabel, directoryName, inProgressWindowFilesBackedUp, completedAt).exceptionOrNull()?.let {
                 failures += BackupFailure(FailureScope.Path(inProgressLabel), it)
             }
         }
@@ -252,3 +289,22 @@ class BackupRunner(
         }
     }
 }
+
+// (lowerBound, upperBound] - strictly after lowerBound, up to and including upperBound.
+internal data class BackupWindow(val lowerBound: Instant, val upperBound: Instant)
+
+// Splits (from, to] into consecutive windows no longer than chunkDuration
+internal fun chunkWindows(from: Instant, to: Instant, chunkDuration: Duration = 1.days): List<BackupWindow> {
+    if (from >= to) return emptyList()
+    val windows = mutableListOf<BackupWindow>()
+    var lowerBound = from
+    while (lowerBound < to) {
+        val upperBound = minOf(lowerBound + chunkDuration, to)
+        windows += BackupWindow(lowerBound, upperBound)
+        lowerBound = upperBound
+    }
+    return windows
+}
+
+internal fun backupDirectoryNameFor(instant: Instant): String =
+    instant.truncatedToWholeSeconds().toString().replace(':', '-')
