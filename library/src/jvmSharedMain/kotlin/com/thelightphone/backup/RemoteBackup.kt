@@ -1,15 +1,18 @@
 package com.thelightphone.backup
 
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.io.files.Path
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.concurrent.TimeoutException
 import kotlin.random.Random
 import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
+import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
 enum class RemoteBackupProvider {
@@ -77,6 +80,12 @@ internal fun InputStream.readChunk(maxLength: Int): ByteArray {
 
 data class BackupPath(val authority: String, val localPath: Path, val label: String)
 
+// label becomes a single path segment directly under rootFolderPath (see BackupRunner.run), so a
+// label a client didn't sanitize (e.g. containing "..") must never be allowed to address anything
+// outside its own rootFolderPath/<label> subtree - including another label's _meta folder.
+internal fun BackupPath.hasValidLabel(): Boolean =
+    label.isNotEmpty() && label != "." && label != ".." && '/' !in label && '\\' !in label
+
 interface BackupDataSource {
     suspend fun getPathsToBackUp(): Result<List<BackupPath>>
 
@@ -139,7 +148,24 @@ class BackupRunner(
     private val dataSource: BackupDataSource,
     private val clock: Clock = Clock.System,
     private val chunkDuration: Duration = 1.days,
+    // Called once upfront with the full window count, then again after every window BackupRunner finishes with.
+    private val onProgress: suspend (BackupProgress) -> Unit = {},
+    private val maxWindowsPerPathPerRun: Int = 365 * 2, // LP3 is about 2 years old at time of typing?
+    private val maxFilesPerWindow: Int = 100000,
+    private val dataSourceTimeout: Duration = 45.seconds,
 ) {
+    // One path's plan for this run: which windows (see chunkWindows) it still needs to catch up
+    // on. Computed for every path upfront so the total window count is known before any uploading
+    // starts, rather than discovered incrementally as each path is reached.
+    private data class PathPlan(val path: BackupPath, val windows: List<BackupWindow>)
+
+    // Every dataSource call BackupRunner makes goes through this, so a hung/deadlocked client
+    // implementation degrades to an ordinary (non-fatal) Result.failure instead of blocking the
+    // run - and now, since the worker runs as a foreground service, potentially forever.
+    private suspend fun <T> dataSourceCall(block: suspend () -> Result<T>): Result<T> =
+        withTimeoutOrNull(dataSourceTimeout) { block() }
+            ?: Result.failure(TimeoutException("dataSource call did not complete within $dataSourceTimeout"))
+
     suspend fun run(): BackupResult {
         // structure in backup root in cloud is
         // tool-id/date/file.example
@@ -152,97 +178,138 @@ class BackupRunner(
             return BackupResult.Failed(BackupFailure(FailureScope.Run, it))
         }
 
-        val paths = dataSource.getPathsToBackUp().getOrElse {
+        val paths = dataSourceCall { dataSource.getPathsToBackUp() }.getOrElse {
             return BackupResult.Failed(BackupFailure(FailureScope.Run, it))
         }
 
         var filesBackedUp = 0
         val failures = mutableListOf<BackupFailure>()
 
+        val plans = mutableListOf<PathPlan>()
         for (path in paths) {
-            val resumeFrom = timesOfLastBackup[path.label] ?: dataSource
-                .getEarliestPossibleBackupDate(path.localPath)
-                .getOrElse {
-                    failures += BackupFailure(FailureScope.Path(path.label), it)
-                    continue
-                }
+            if (!path.hasValidLabel()) {
+                failures += BackupFailure(
+                    FailureScope.Path(path.label),
+                    IllegalArgumentException("invalid label \"${path.label}\" - must be a single path segment"),
+                )
+                continue
+            }
 
-            for (window in chunkWindows(resumeFrom, now, chunkDuration)) {
-                val directoryName = backupDirectoryNameFor(window.upperBound)
+            val resumeFrom = timesOfLastBackup[path.label] ?: dataSourceCall {
+                dataSource.getEarliestPossibleBackupDate(path.localPath)
+            }.getOrElse {
+                failures += BackupFailure(FailureScope.Path(path.label), it)
+                continue
+            }
+            plans += PathPlan(path, chunkWindows(resumeFrom, now, chunkDuration).take(maxWindowsPerPathPerRun))
+        }
 
-                val files = dataSource
-                    .getFilesToBackUpForPath(path.localPath, window.lowerBound, window.upperBound)
-                    .getOrElse {
+        val totalWindows = plans.sumOf { it.windows.size }
+        var windowsCompleted = 0
+        onProgress(BackupProgress(windowsCompleted, totalWindows))
+
+        for ((path, windows) in plans) {
+            for (window in windows) {
+                // finally (rather than one increment per exit point below) so every way of
+                // leaving this window's body - continuing past it, or returning to abort the run
+                // - still advances/reports progress exactly once.
+                try {
+                    val directoryName = backupDirectoryNameFor(window.upperBound)
+
+                    val reportedFiles = dataSourceCall {
+                        dataSource.getFilesToBackUpForPath(path.localPath, window.lowerBound, window.upperBound)
+                    }.getOrElse {
                         // Local listing failures are never fatal to the run (see isFatalToBackupRun)
                         failures += BackupFailure(FailureScope.Path(path.label), it)
                         continue
                     }
 
-                if (files.isEmpty()) continue
+                    if (reportedFiles.isEmpty()) continue
 
-                val windowRemotePath = Path(Path(remoteBackup.rootFolderPath, path.label), directoryName)
-
-                remoteBackup.createDirectory(windowRemotePath).exceptionOrNull()?.let { cause ->
-                    val failure = BackupFailure(FailureScope.Path(path.label), cause)
-                    if (cause.isFatalToBackupRun()) {
-                        return abort(filesBackedUp, failures, path.label, directoryName, 0, window.upperBound, failure)
+                    // A window whose true count exceeds the cap is never marked complete (see the
+                    // meta-entry check below) - the untouched remainder is retried, not dropped, on
+                    // the next run.
+                    val truncated = reportedFiles.size > maxFilesPerWindow
+                    val files = if (truncated) reportedFiles.take(maxFilesPerWindow) else reportedFiles
+                    if (truncated) {
+                        failures += BackupFailure(
+                            FailureScope.Path(path.label),
+                            IllegalStateException(
+                                "window reported ${reportedFiles.size} files, exceeding the cap of " +
+                                    "$maxFilesPerWindow; uploading the first $maxFilesPerWindow and retrying the rest next run",
+                            ),
+                        )
                     }
-                    failures += failure
-                    continue
-                }
 
-                val checksums = mutableListOf<Pair<String, String>>()
-                var windowFilesBackedUp = 0
+                    val windowRemotePath = Path(Path(remoteBackup.rootFolderPath, path.label), directoryName)
 
-                for (file in files) {
-                    val data = dataSource.readFile(file).getOrElse {
-                        failures += BackupFailure(FailureScope.File(path.label, file.name), it)
-                        continue
-                    }
-                    val uploadError = remoteBackup.uploadFile(windowRemotePath, file.name, data).exceptionOrNull()
-                    if (uploadError != null) {
-                        val failure = BackupFailure(FailureScope.File(path.label, file.name), uploadError)
-                        if (uploadError.isFatalToBackupRun()) {
-                            return abort(
-                                filesBackedUp, failures, path.label, directoryName,
-                                windowFilesBackedUp, window.upperBound, failure,
-                            )
+                    remoteBackup.createDirectory(windowRemotePath).exceptionOrNull()?.let { cause ->
+                        val failure = BackupFailure(FailureScope.Path(path.label), cause)
+                        if (cause.isFatalToBackupRun()) {
+                            return abort(filesBackedUp, failures, path.label, directoryName, 0, window.upperBound, failure)
                         }
                         failures += failure
                         continue
                     }
-                    filesBackedUp++
-                    windowFilesBackedUp++
 
-                    // The file is backed up either way at this point - a hash failure only means it
-                    // won't be verifiable via the manifest, not that the upload itself is invalid.
-                    dataSource.hashForFile(file).fold(
-                        onSuccess = { hash -> checksums += file.name to hash },
-                        onFailure = { failures += BackupFailure(FailureScope.File(path.label, file.name), it) },
-                    )
-                }
+                    val checksums = mutableListOf<Pair<String, String>>()
+                    var windowFilesBackedUp = 0
 
-                if (checksums.isNotEmpty()) {
-                    val manifest = buildChecksumManifest(checksums)
-                    val manifestError = remoteBackup
-                        .uploadFile(windowRemotePath, CHECKSUM_MANIFEST_FILE_NAME, manifest.inputStream())
-                        .exceptionOrNull()
-                    if (manifestError != null) {
-                        val failure = BackupFailure(FailureScope.Path(path.label), manifestError)
-                        if (manifestError.isFatalToBackupRun()) {
-                            return abort(
-                                filesBackedUp, failures, path.label, directoryName,
-                                windowFilesBackedUp, window.upperBound, failure,
-                            )
+                    for (file in files) {
+                        val data = dataSourceCall { dataSource.readFile(file) }.getOrElse {
+                            failures += BackupFailure(FailureScope.File(path.label, file.name), it)
+                            continue
                         }
-                        failures += failure
-                    }
-                }
+                        val uploadError = remoteBackup.uploadFile(windowRemotePath, file.name, data).exceptionOrNull()
+                        if (uploadError != null) {
+                            val failure = BackupFailure(FailureScope.File(path.label, file.name), uploadError)
+                            if (uploadError.isFatalToBackupRun()) {
+                                return abort(
+                                    filesBackedUp, failures, path.label, directoryName,
+                                    windowFilesBackedUp, window.upperBound, failure,
+                                )
+                            }
+                            failures += failure
+                            continue
+                        }
+                        filesBackedUp++
+                        windowFilesBackedUp++
 
-                if (windowFilesBackedUp > 0) {
-                    writeMetaEntry(path.label, directoryName, windowFilesBackedUp, window.upperBound).exceptionOrNull()?.let {
-                        failures += BackupFailure(FailureScope.Path(path.label), it)
+                        // The file is backed up either way at this point - a hash failure only means it
+                        // won't be verifiable via the manifest, not that the upload itself is invalid.
+                        dataSourceCall { dataSource.hashForFile(file) }.fold(
+                            onSuccess = { hash -> checksums += file.name to hash },
+                            onFailure = { failures += BackupFailure(FailureScope.File(path.label, file.name), it) },
+                        )
                     }
+
+                    if (checksums.isNotEmpty()) {
+                        val manifest = buildChecksumManifest(checksums)
+                        val manifestError = remoteBackup
+                            .uploadFile(windowRemotePath, CHECKSUM_MANIFEST_FILE_NAME, manifest.inputStream())
+                            .exceptionOrNull()
+                        if (manifestError != null) {
+                            val failure = BackupFailure(FailureScope.Path(path.label), manifestError)
+                            if (manifestError.isFatalToBackupRun()) {
+                                return abort(
+                                    filesBackedUp, failures, path.label, directoryName,
+                                    windowFilesBackedUp, window.upperBound, failure,
+                                )
+                            }
+                            failures += failure
+                        }
+                    }
+
+                    // Not written if truncated - this window isn't actually done, so resumeFrom
+                    // must not advance past it (see the truncation check above).
+                    if (windowFilesBackedUp > 0 && !truncated) {
+                        writeMetaEntry(path.label, directoryName, windowFilesBackedUp, window.upperBound).exceptionOrNull()?.let {
+                            failures += BackupFailure(FailureScope.Path(path.label), it)
+                        }
+                    }
+                } finally {
+                    windowsCompleted++
+                    onProgress(BackupProgress(windowsCompleted, totalWindows))
                 }
             }
         }

@@ -1,17 +1,21 @@
 package com.thelightphone.backup
 
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.io.files.Path
 import org.junit.Before
 import org.junit.Test
 import java.io.IOException
 import java.io.InputStream
+import java.util.concurrent.TimeoutException
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.time.Clock
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
@@ -188,6 +192,36 @@ abstract class BackupRunnerContractTest {
     }
 
     @Test
+    fun run_reportsProgressOncePerWindowPlusAnUpfrontTotal() = runBlocking {
+        val start = Clock.System.now()
+        val clock = FakeClock(start + 3.hours)
+        val dataSource = FakeBackupDataSource(
+            paths = listOf(BackupPath("com.example", Path("dir1"), "dir1")),
+            earliestPossibleBackupDate = start,
+            filesForWindow = { label, _, upperBound -> Result.success(listOf("$label-${upperBound.epochSeconds}.txt")) },
+        )
+        val progressUpdates = mutableListOf<BackupProgress>()
+        val runner = BackupRunner(
+            remoteBackup, dataSource, clock, chunkDuration = 1.hours,
+            onProgress = { progressUpdates += it },
+        )
+
+        assertIs<BackupResult.Completed>(runner.run())
+
+        // The total (3 windows) is known upfront, before any window is processed, then one update
+        // per window as BackupRunner finishes with it.
+        assertEquals(
+            listOf(
+                BackupProgress(0, 3),
+                BackupProgress(1, 3),
+                BackupProgress(2, 3),
+                BackupProgress(3, 3),
+            ),
+            progressUpdates,
+        )
+    }
+
+    @Test
     fun run_withSparseWindows_onlyCreatesFoldersAndMetaEntriesForWindowsThatHadFiles() = runBlocking {
         val start = Clock.System.now()
         val clock = FakeClock(start + 3.hours)
@@ -318,6 +352,92 @@ abstract class BackupRunnerContractTest {
         assertEquals(FailureScope.Path("dir2"), result.failures.single().scope)
     }
 
+    @Test
+    fun run_withAnInvalidLabel_recordsAFailureAndDoesNotEscapeItsOwnSubtree() = runBlocking {
+        val paths = listOf(
+            BackupPath("com.example", Path("dir1"), "dir1"),
+            // Attempts to address dir1's own folder directly instead of its own - see
+            // BackupPath.hasValidLabel.
+            BackupPath("com.evil", Path("evil"), "../dir1"),
+        )
+        val dataSource = FakeBackupDataSource(paths, filesPerPath = 1)
+        val runner = BackupRunner(remoteBackup, dataSource)
+
+        val result = runner.run()
+
+        assertIs<BackupResult.Partial>(result)
+        assertEquals(1, result.filesBackedUp, "expected only the legitimate dir1 path to back up")
+        assertEquals(FailureScope.Path("../dir1"), result.failures.single().scope)
+
+        // The malicious label never got as far as touching dir1's own _meta folder.
+        val dir1MetaFiles = remoteBackup
+            .listFiles(Path(Path(remoteBackup.rootFolderPath, "dir1"), META_FOLDER_NAME))
+            .getOrThrow()
+        assertEquals(1, dir1MetaFiles.size, "expected only dir1's own _meta entry, got $dir1MetaFiles")
+    }
+
+    @Test
+    fun run_withMoreWindowsThanTheCapForAPath_onlyProcessesTheCapAndLeavesTheRestForFutureRuns() = runBlocking {
+        val start = Clock.System.now()
+        val clock = FakeClock(start + 5.hours)
+        val dataSource = FakeBackupDataSource(
+            paths = listOf(BackupPath("com.example", Path("dir1"), "dir1")),
+            earliestPossibleBackupDate = start,
+            filesForWindow = { label, _, upperBound -> Result.success(listOf("$label-${upperBound.epochSeconds}.txt")) },
+        )
+        val runner = BackupRunner(remoteBackup, dataSource, clock, chunkDuration = 1.hours, maxWindowsPerPathPerRun = 2)
+
+        val firstResult = runner.run()
+        assertIs<BackupResult.Completed>(firstResult)
+        assertEquals(2, firstResult.filesBackedUp, "expected only the capped 2 of 5 windows to be processed")
+
+        val secondResult = runner.run()
+        assertIs<BackupResult.Completed>(secondResult)
+        assertEquals(2, secondResult.filesBackedUp, "expected the next 2 windows on the following run")
+
+        val thirdResult = runner.run()
+        assertIs<BackupResult.Completed>(thirdResult)
+        assertEquals(1, thirdResult.filesBackedUp, "expected the final remaining window on a third run")
+    }
+
+    @Test
+    fun run_whenAWindowReportsMoreFilesThanTheCap_uploadsTheCapAndDoesNotMarkTheWindowComplete() = runBlocking {
+        val paths = listOf(BackupPath("com.example", Path("dir1"), "dir1"))
+        val dataSource = FakeBackupDataSource(paths, filesPerPath = 5)
+        val runner = BackupRunner(remoteBackup, dataSource, maxFilesPerWindow = 3)
+
+        val result = runner.run()
+
+        assertIs<BackupResult.Partial>(result)
+        assertEquals(3, result.filesBackedUp, "expected only the capped 3 of 5 files to be uploaded")
+        assertEquals(FailureScope.Path("dir1"), result.failures.single().scope)
+
+        // Not marked complete - no _meta entry, so a retry won't skip past the untouched remainder.
+        val dir1MetaFiles = remoteBackup
+            .listFiles(Path(Path(remoteBackup.rootFolderPath, "dir1"), META_FOLDER_NAME))
+            .getOrElse { if (it is RemoteBackupError.NotFound) emptyList() else throw it }
+        assertEquals(0, dir1MetaFiles.size, "expected no _meta entry since the window wasn't fully drained")
+
+        val mostRecent = remoteBackup.getMostRecentBackupDates().getOrThrow()
+        assertTrue("dir1" !in mostRecent, "expected dir1's resumeFrom to not have advanced")
+    }
+
+    @Test
+    fun run_whenADataSourceCallHangs_timesOutAsANonFatalFailureInsteadOfBlockingTheRun() = runBlocking {
+        val paths = listOf(BackupPath("com.example", Path("dir1"), "dir1"))
+        val dataSource = FakeBackupDataSource(paths, filesPerPath = 1, getFilesToBackUpForPathDelay = 5.seconds)
+        val runner = BackupRunner(remoteBackup, dataSource, dataSourceTimeout = 50.milliseconds)
+
+        val result = runner.run()
+
+        assertIs<BackupResult.Partial>(result)
+        assertEquals(0, result.filesBackedUp)
+        val failure = result.failures.single()
+        assertEquals(FailureScope.Path("dir1"), failure.scope)
+        assertIs<TimeoutException>(failure.cause)
+        Unit
+    }
+
     // There should be exactly one non-_meta subfolder under rootFolderPath/label; returns its name.
     private suspend fun onlyWindowFolder(label: String): String =
         remoteBackup.listSubdirectories(Path(remoteBackup.rootFolderPath, label)).getOrThrow()
@@ -333,6 +453,8 @@ private class FakeBackupDataSource(
     private val earliestPossibleBackupDate: Instant = Clock.System.now() - 1.hours,
     private val earliestPossibleBackupDateFailure: Throwable? = null,
     private val filesForWindow: ((label: String, lowerBound: Instant, upperBound: Instant) -> Result<List<String>>)? = null,
+    // Simulates a hung/slow client implementation - see dataSourceTimeout.
+    private val getFilesToBackUpForPathDelay: Duration? = null,
 ) : BackupDataSource {
     override suspend fun getPathsToBackUp(): Result<List<BackupPath>> = Result.success(paths)
 
@@ -341,6 +463,7 @@ private class FakeBackupDataSource(
         lowerBound: Instant,
         upperBound: Instant,
     ): Result<List<Path>> {
+        getFilesToBackUpForPathDelay?.let { delay(it) }
         filesForWindow?.let { return it(parent.name, lowerBound, upperBound).map { names -> names.map(::Path) } }
         if (parent.name in emptyLabels) return Result.success(emptyList())
         return Result.success((1..filesPerPath).map { Path("${parent.name}-file$it.txt") })
