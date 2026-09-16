@@ -13,6 +13,9 @@ sealed class FailureScope {
 
 data class BackupFailure(val scope: FailureScope, val cause: Throwable)
 
+// Where "window" is per app, per day
+data class BackupProgress(val windowsCompleted: Int, val totalWindows: Int)
+
 sealed class BackupResult {
     // Every planned file was uploaded.
     data class Completed(val filesBackedUp: Int) : BackupResult()

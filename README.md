@@ -29,14 +29,17 @@ This repo is open source, but is depended on by shipping Light Phone products - 
   for examples.
 - [**`BackupDataSource`**](library/src/jvmSharedMain/kotlin/com/thelightphone/backup/RemoteBackup.kt) -
   the interface a host app implements to say *what* to back up (`getPathsToBackUp`,
-  `getFilesToBackUpForPath`, `readFile`, `hashForFile`). This library ships no implementation, it
-  only knows how to move bytes once told which ones.
+  `getFilesToBackUpForPath`, `readFile`, `hashForFile`, `getEarliestPossibleBackupDate`). This
+  library ships no implementation, it only knows how to move bytes once told which ones.
 - [**`BackupRunner`**](library/src/jvmSharedMain/kotlin/com/thelightphone/backup/RemoteBackup.kt) -
-  orchestrates one backup pass: walks each path, uploads what's changed since that path's last
-  backup, writes its checksum manifest, and records a `_meta` entry for any path that made progress
-  (these are used to determine time of last successful backup). Platform-agnostic - on Android it's
-  invoked by [`BackupWorker`](library/src/androidMain/kotlin/com/thelightphone/backup/BackupWorker.kt),
-  an Android WorkManager `CoroutineWorker`.
+  orchestrates one backup pass: for each path, splits the time since its last backup into bounded,
+  independently-completable windows (one day by default - see `chunkWindows`), uploads what's changed
+  within each window, writes its checksum manifest, and records a `_meta` entry for any window that
+  made progress (these are used to determine time of last successful backup). Windowing means a long
+  catch-up period doesn't have to be redone in full after a partial failure - only the windows after
+  the last one that completed do. Platform-agnostic - on Android it's invoked by
+  [`BackupWorker`](library/src/androidMain/kotlin/com/thelightphone/backup/BackupWorker.kt), an
+  Android WorkManager `CoroutineWorker`.
 - [**`RemoteAccessTokenProvider`** /
   **`StoredOAuthTokenProvider`**](library/src/jvmSharedMain/kotlin/com/thelightphone/backup/RemoteAccessTokenProvider.kt) -
   provider-agnostic OAuth access token caching, refresh, and persistence.

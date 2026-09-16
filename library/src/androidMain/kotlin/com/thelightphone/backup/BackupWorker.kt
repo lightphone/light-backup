@@ -1,10 +1,16 @@
 package com.thelightphone.backup
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
+import android.content.pm.ServiceInfo
+import android.os.Build
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
+import androidx.work.ForegroundInfo
 import androidx.work.ListenableWorker
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
@@ -13,13 +19,16 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerFactory
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
-import kotlin.time.Instant
 import kotlin.time.toJavaDuration
 
-// Runs one BackupRunner pass
+// Runs one BackupRunner pass. Always promoted to a foreground service (see buildForegroundInfo) -
+// an initial backup can run long enough that the OS would otherwise kill a plain background
+// worker partway through. LightOS's Android fork doesn't render the notification a foreground
+// service is normally required to show, so unlike a typical app this costs nothing in visible UI.
 class BackupWorker(
     context: Context,
     params: WorkerParameters,
@@ -32,8 +41,23 @@ class BackupWorker(
         val provider = preferences.getActiveProvider() ?: return Result.success()
         val remoteBackup = buildRemoteBackup(provider) ?: return Result.failure()
 
-        val runner = BackupRunner(remoteBackup, dependencyProvider.createDataSource(), clock)
-        return when (val result = runner.run(todayDirectoryName(clock.now()))) {
+        ensureNotificationChannel()
+        setForeground(buildForegroundInfo())
+
+        val runner = BackupRunner(
+            remoteBackup,
+            dependencyProvider.createDataSource(),
+            clock,
+            onProgress = { progress ->
+                setProgress(
+                    workDataOf(
+                        PROGRESS_WINDOWS_COMPLETED to progress.windowsCompleted,
+                        PROGRESS_TOTAL_WINDOWS to progress.totalWindows,
+                    ),
+                )
+            },
+        )
+        return when (val result = runner.run()) {
             is BackupResult.Completed -> {
                 preferences.setLastBackupStatus(BackupStatus.Succeeded(clock.now()))
                 Result.success()
@@ -41,6 +65,24 @@ class BackupWorker(
 
             is BackupResult.Partial -> recordFailureAndDecide(result.abortedBy?.cause)
             is BackupResult.Failed -> recordFailureAndDecide(result.cause.cause)
+        }
+    }
+
+    private fun ensureNotificationChannel() {
+        val channel = NotificationChannel(NOTIFICATION_CHANNEL_ID, "Backup", NotificationManager.IMPORTANCE_LOW)
+        applicationContext.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+
+    private fun buildForegroundInfo(): ForegroundInfo {
+        val notification = Notification.Builder(applicationContext, NOTIFICATION_CHANNEL_ID)
+            .setContentTitle("LightOS Backup")
+            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setOngoing(true)
+            .build()
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ForegroundInfo(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            ForegroundInfo(NOTIFICATION_ID, notification)
         }
     }
 
@@ -74,11 +116,17 @@ class BackupWorker(
             )
         }
     }
-}
 
-// "yyyy-MM-ddTHH-mm-ssZ"
-private fun todayDirectoryName(now: Instant): String =
-    Instant.fromEpochSeconds(now.epochSeconds).toString().replace(":", "-")
+    companion object {
+        // Keys into the Data reported via CoroutineWorker.setProgress(), observable through
+        // WorkInfo.progress - values are BackupProgress.windowsCompleted/totalWindows.
+        const val PROGRESS_WINDOWS_COMPLETED = "windowsCompleted"
+        const val PROGRESS_TOTAL_WINDOWS = "totalWindows"
+
+        private const val NOTIFICATION_CHANNEL_ID = "light-backup"
+        private const val NOTIFICATION_ID = 1
+    }
+}
 
 // use a worker factory:
 //   class App : Application(), Configuration.Provider {
