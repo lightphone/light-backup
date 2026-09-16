@@ -7,7 +7,7 @@ kotlinx-coroutines = "1.10.2"
 kotlinx-io = "0.8.2"
 junit = "4.13.2"
 vanniktechMavenPublish = "0.35.0"
-toolmanager = "0.0.13"
+toolmanager = "0.0.14"
 ktor = "3.4.2"
 androidxWork = "2.10.0"
 
