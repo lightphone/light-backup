@@ -153,6 +153,10 @@ class BackupRunner(
     private val maxWindowsPerPathPerRun: Int = 365 * 2, // LP3 is about 2 years old at time of typing?
     private val maxFilesPerWindow: Int = 100000,
     private val dataSourceTimeout: Duration = 45.seconds,
+    // when a source returns the time of earliest file to be backed up
+    // (in the cae where no backup has ever happened for that source)
+    // buffer some time before that timestamp so it doesn't get skipped
+    private val earliestBackupTimeBeforeBuffer: Duration = 1.days
 ) {
     // One path's plan for this run: which windows (see chunkWindows) it still needs to catch up
     // on. Computed for every path upfront so the total window count is known before any uploading
@@ -197,6 +201,9 @@ class BackupRunner(
 
             val resumeFrom = timesOfLastBackup[path.label] ?: dataSourceCall {
                 dataSource.getEarliestPossibleBackupDate(path.localPath)
+                    // buffer one extra day since data sources may report timestamp of oldest file,
+                    // which would get skipped since lowerBound is exclusive
+                    .map { it - earliestBackupTimeBeforeBuffer }
             }.getOrElse {
                 failures += BackupFailure(FailureScope.Path(path.label), it)
                 continue

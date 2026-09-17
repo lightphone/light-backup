@@ -11,7 +11,7 @@ plugins {
 
 allprojects {
     group = "com.thelightphone.backup"
-    version = "0.0.5"
+    version = "0.0.6"
 
     plugins.withId("com.vanniktech.maven.publish") {
         extensions.configure<MavenPublishBaseExtension> {
