@@ -7,7 +7,6 @@ kotlinx-coroutines = "1.10.2"
 kotlinx-io = "0.8.2"
 junit = "4.13.2"
 vanniktechMavenPublish = "0.35.0"
-toolmanager = "0.0.14"
 ktor = "3.4.2"
 androidxWork = "2.10.0"
 
@@ -20,7 +19,6 @@ kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serializa
 kotlinx-datetime = { module = "org.jetbrains.kotlinx:kotlinx-datetime", version.ref = "kotlinx-datetime" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinx-coroutines" }
 kotlinx-io-core = { module = "org.jetbrains.kotlinx:kotlinx-io-core", version.ref = "kotlinx-io" }
-light-toolmanager-server = { module = "com.thelightphone.toolmanager:server", version.ref = "toolmanager" }
 ktor-clientCore = { module = "io.ktor:ktor-client-core", version.ref = "ktor" }
 ktor-clientCio = { module = "io.ktor:ktor-client-cio", version.ref = "ktor" }
 ktor-clientWebsockets = { module = "io.ktor:ktor-client-websockets", version.ref = "ktor" }

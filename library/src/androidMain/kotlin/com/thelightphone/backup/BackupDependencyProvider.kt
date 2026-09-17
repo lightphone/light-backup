@@ -9,9 +9,6 @@ interface BackupDependencyProvider {
     // What to back up. Independent of which cloud provider the run is targeting.
     fun createDataSource(): BackupDataSource
 
-    // For (re-)authenticating an account
-    fun createOAuthTunnelClient(provider: RemoteBackupProvider): OAuthTunnelClient?
-
     // Root folder within the provider's storage that backups are written under.
     fun rootFolderPath(): String
 

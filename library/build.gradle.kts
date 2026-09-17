@@ -47,7 +47,6 @@ kotlin {
             implementation(libs.kotlinx.datetime)
             implementation(libs.kotlinx.coroutines.core)
             implementation(libs.kotlinx.io.core)
-            implementation(libs.light.toolmanager.server)
             implementation(libs.ktor.clientCore)
             implementation(libs.ktor.clientCio)
             implementation(libs.ktor.clientWebsockets)
