@@ -20,6 +20,9 @@ import androidx.work.WorkManager
 import androidx.work.WorkerFactory
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
@@ -43,6 +46,7 @@ class BackupWorker(
 
         ensureNotificationChannel()
         setForeground(buildForegroundInfo())
+        preferences.setLastBackupStatus(BackupStatus.InProgress(clock.now()))
 
         val runner = BackupRunner(
             remoteBackup,
@@ -57,14 +61,25 @@ class BackupWorker(
                 )
             },
         )
-        return when (val result = runner.run()) {
-            is BackupResult.Completed -> {
-                preferences.setLastBackupStatus(BackupStatus.Succeeded(clock.now()))
-                Result.success()
-            }
+        return try {
+            when (val result = runner.run()) {
+                is BackupResult.Completed -> {
+                    preferences.setLastBackupStatus(BackupStatus.Succeeded(clock.now()))
+                    Result.success()
+                }
 
-            is BackupResult.Partial -> recordFailureAndDecide(result.abortedBy?.cause)
-            is BackupResult.Failed -> recordFailureAndDecide(result.cause.cause)
+                is BackupResult.Partial -> recordFailureAndDecide(result.abortedBy?.cause)
+                is BackupResult.Failed -> recordFailureAndDecide(result.cause.cause)
+            }
+        } catch (e: CancellationException) {
+            // Job's already cancelled, so writing the status needs NonCancellable to run at all.
+            withContext(NonCancellable) {
+                preferences.setLastBackupStatus(BackupStatus.Failed(e.message ?: "backup cancelled", clock.now()))
+            }
+            throw e
+        } catch (e: Exception) {
+            preferences.setLastBackupStatus(BackupStatus.Failed(e.message ?: "backup failed", clock.now()))
+            Result.retry()
         }
     }
 
@@ -88,17 +103,17 @@ class BackupWorker(
 
     private suspend fun recordFailureAndDecide(cause: Throwable?): Result = when (cause) {
         is RemoteBackupError.Unauthorized -> {
-            preferences.setLastBackupStatus(BackupStatus.NeedsReauth)
+            preferences.setLastBackupStatus(BackupStatus.NeedsReauth(clock.now()))
             Result.failure()
         }
 
         is RemoteBackupError.QuotaExceeded -> {
-            preferences.setLastBackupStatus(BackupStatus.QuotaExceeded)
+            preferences.setLastBackupStatus(BackupStatus.QuotaExceeded(clock.now()))
             Result.failure()
         }
 
         else -> {
-            preferences.setLastBackupStatus(BackupStatus.Failed(cause?.message ?: "backup failed"))
+            preferences.setLastBackupStatus(BackupStatus.Failed(cause?.message ?: "backup failed", clock.now()))
             Result.retry()
         }
     }
