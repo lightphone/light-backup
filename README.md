@@ -6,11 +6,6 @@ gets backed up and what that data looks like when stored. At backup time, a tool
 the timestamp of each of its paths' last successful backup, and based on that it will provide a list of
 files to be copied onto the user's cloud storage.
 
-Also of interest is
-[`OAuthJobDataTree`](library/src/jvmSharedMain/kotlin/com/thelightphone/backup/OAuthJobDataTree.kt),
-which demonstrates how to use Tool Manager's `job` abstraction to hook up OAuth login for various
-providers.
-
 Though this will be primarily used by LightOS, we will put as much of the actual code that consumes it
 inside the `server` module of the SDK, and we will at least hook up one dummy cloud provider in the
 LightOS emulator so you can test your own tools' backups.
@@ -40,14 +35,11 @@ This repo is open source, but is depended on by shipping Light Phone products - 
   the last one that completed do. Platform-agnostic - on Android it's invoked by
   [`BackupWorker`](library/src/androidMain/kotlin/com/thelightphone/backup/BackupWorker.kt), an
   Android WorkManager `CoroutineWorker`.
-- [**`RemoteAccessTokenProvider`** /
-  **`StoredOAuthTokenProvider`**](library/src/jvmSharedMain/kotlin/com/thelightphone/backup/RemoteAccessTokenProvider.kt) -
-  provider-agnostic OAuth access token caching, refresh, and persistence.
-- [**`OAuthTunnelClient`**](library/src/jvmSharedMain/kotlin/com/thelightphone/backup/OAuthTunnelClient.kt) -
-  the device-side half of the OAuth linking flow, talking to the companion
-  [light-oauth-relay](https://github.com/lightphone/light-oauth-relay) worker. Supports both
-  server-side token exchange (`EXCHANGE`, for providers that require a client secret) and
-  on-device exchange (`RELAY`).
+- [**`RemoteAccessTokenProvider`**](library/src/jvmSharedMain/kotlin/com/thelightphone/backup/RemoteAccessTokenProvider.kt) -
+  provider-agnostic interface for access token caching and invalidation. Implementations (and the
+  OAuth linking flow, which talks to the companion
+  [light-oauth-relay](https://github.com/lightphone/light-oauth-relay) worker) live in the SDK
+  `server` module.
 
 ## Project layout
 
@@ -56,7 +48,6 @@ Integration tests (which write to actual cloud storage) can be run on a PC.
 
 ```
 library/src/
-  commonMain/     # true common code (currently minimal)
   jvmSharedMain/  # shared between jvm() and androidTarget() - most of the library lives here
   jvmSharedTest/  # tests for the above, run on the jvm() target
   jvmMain/        # jvm()-only code
