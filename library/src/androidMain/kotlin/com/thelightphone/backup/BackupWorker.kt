@@ -180,7 +180,7 @@ object BackupScheduler {
     // call on LightOS boot and/or when preferences change
     suspend fun syncSchedule(context: Context, preferences: BackupPreferences) {
         if (preferences.getActiveProvider() == null) {
-            cancel(context)
+            cancelPeriodic(context)
             return
         }
 
@@ -204,8 +204,12 @@ object BackupScheduler {
             )
     }
 
-    fun cancel(context: Context) {
+    fun cancelPeriodic(context: Context) {
         WorkManager.getInstance(context).cancelUniqueWork(PERIODIC_WORK_NAME)
+    }
+
+    fun cancelImmediate(context: Context) {
+        WorkManager.getInstance(context).cancelUniqueWork(IMMEDIATE_WORK_NAME)
     }
 
     fun enqueueImmediateBackup(context: Context) {
