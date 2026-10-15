@@ -19,6 +19,7 @@ android {
 }
 
 kotlin {
+    jvmToolchain(21)
     jvm()
     androidTarget {
         compilerOptions {
@@ -50,6 +51,17 @@ kotlin {
             implementation(libs.ktor.clientCore)
             implementation(libs.ktor.clientCio)
             implementation(libs.ktor.clientWebsockets)
+            implementation(libs.ktor.clientAuth)
+            // dav4jvm needs an XmlPullParser. Android ships one, and xpp3's copy of the same
+            // classes conflicts with it, so xpp3 is only added for the plain JVM target (below).
+            val dav4jvm = libs.dav4jvm.get()
+            implementation("${dav4jvm.module}:${dav4jvm.versionConstraint.requiredVersion}") {
+                exclude(group = "org.ogce", module = "xpp3")
+            }
+        }
+
+        jvmMain.dependencies {
+            implementation(libs.xpp3)
         }
 
         jvmSharedTest.dependencies {

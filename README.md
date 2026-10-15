@@ -1,7 +1,7 @@
 # light-backup
 
 A LightOS module that automatically/periodically backs up a Light Phone user's data to their own cloud storage
-(Google Drive, Dropbox, OneDrive + more to come). Each tool is responsible for managing which of its data
+(Google Drive, Dropbox, any WebDAV server, OneDrive + more to come). Each tool is responsible for managing which of its data
 gets backed up and what that data looks like when stored. At backup time, a tool will be presented with
 the timestamp of each of its paths' last successful backup, and based on that it will provide a list of
 files to be copied onto the user's cloud storage.
@@ -21,7 +21,10 @@ This repo is open source, but is depended on by shipping Light Phone products - 
   [`GoogleDriveRemoteBackup`](library/src/jvmSharedMain/kotlin/com/thelightphone/backup/GoogleDriveRemoteBackup.kt)
   and
   [`DropboxRemoteBackup`](library/src/jvmSharedMain/kotlin/com/thelightphone/backup/DropboxRemoteBackup.kt)
-  for examples.
+  for examples, or
+  [`WebDavRemoteBackup`](library/src/jvmSharedMain/kotlin/com/thelightphone/backup/WebDavRemoteBackup.kt)
+  for a non-OAuth one (Nextcloud, ownCloud, Synology, ...) built on
+  [dav4jvm](https://github.com/bitfireAT/dav4jvm).
 - [**`BackupDataSource`**](library/src/jvmSharedMain/kotlin/com/thelightphone/backup/RemoteBackup.kt) -
   the interface a host app implements to say *what* to back up (`getPathsToBackUp`,
   `getFilesToBackUpForPath`, `readFile`, `hashForFile`, `getEarliestPossibleBackupDate`). This
@@ -40,6 +43,12 @@ This repo is open source, but is depended on by shipping Light Phone products - 
   OAuth linking flow, which talks to the companion
   [light-oauth-relay](https://github.com/lightphone/light-oauth-relay) worker) live in the SDK
   `server` module.
+- [**`RemoteConnection`**](library/src/jvmSharedMain/kotlin/com/thelightphone/backup/RemoteConnection.kt) -
+  how to reach a linked account. The host's `BackupDependencyProvider` should return one per kind:
+  `createOAuthConnection` (a `RemoteAccessTokenProvider`) for Google/Dropbox/other OAuth providers, `createWebDavConnection`
+  (server URL plus Basic or Bearer `WebDavCredentials`), and optionally `createUnspecifiedConnection`
+  for a `Custom` backend. There's no linking flow for WebDAV, so the host should call
+  `WebDavRemoteBackup.verify()` to validate a server URL and credentials before saving them.
 
 ## Project layout
 
@@ -74,4 +83,9 @@ and
 they write real files into real cloud storage. They're skipped automatically unless you set
 `GOOGLE_DRIVE_TEST_ACCESS_TOKEN` and/or `DROPBOX_TEST_ACCESS_TOKEN` to a valid access token for a
 disposable/test account. Use with caution.
+
+The WebDAV equivalents (`WebDav*ContractTest`) run whenever `WEBDAV_TEST_URL` (plus
+`WEBDAV_TEST_USERNAME`/`WEBDAV_TEST_PASSWORD`) is set. They need no real account - CI runs them against
+a throwaway local server, and [`.github/webdav-test-server.yaml`](.github/webdav-test-server.yaml)
+shows how to run the same one yourself.
 
