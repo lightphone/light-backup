@@ -22,11 +22,11 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -36,5 +36,19 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # Local throwaway server for the WebDAV contract tests - the other providers' contract tests
+      # need real accounts, so they're skipped here.
+      - name: Start WebDAV test server
+        run: |
+          pip install wsgidav==4.3.5 cheroot==11.1.2
+          mkdir -p /tmp/webdav-test-root
+          wsgidav --config .github/webdav-test-server.yaml > /tmp/wsgidav.log 2>&1 &
+          curl --retry 10 --retry-connrefused --retry-delay 1 -sf -o /dev/null \
+            -u test:test -X PROPFIND -H 'Depth: 0' http://127.0.0.1:8099/dav/
+
       - name: Run check
         run: ./gradlew check --stacktrace
+        env:
+          WEBDAV_TEST_URL: http://127.0.0.1:8099/dav
+          WEBDAV_TEST_USERNAME: test
+          WEBDAV_TEST_PASSWORD: test

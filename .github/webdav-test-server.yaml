@@ -1,0 +1,17 @@
+# Throwaway WebDAV server for the WebDAV contract tests (see WebDavTestSupport.kt):
+#   mkdir -p /tmp/webdav-test-root
+#   uvx --from wsgidav==4.3.5 --with cheroot==11.1.2 wsgidav --config .github/webdav-test-server.yaml
+#   WEBDAV_TEST_URL=http://127.0.0.1:8099/dav WEBDAV_TEST_USERNAME=test WEBDAV_TEST_PASSWORD=test ./gradlew check
+host: 127.0.0.1
+port: 8099
+provider_mapping:
+  "/dav": "/tmp/webdav-test-root"
+simple_dc:
+  user_mapping:
+    "*":
+      "test":
+        password: "test"
+http_authenticator:
+  accept_basic: true
+  accept_digest: false
+  default_to_digest: false

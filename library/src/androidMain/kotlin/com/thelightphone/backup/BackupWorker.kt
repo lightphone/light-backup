@@ -118,16 +118,29 @@ class BackupWorker(
         }
     }
 
-    private fun buildRemoteBackup(provider: RemoteBackupProvider): RemoteBackup? {
-        val tokenProvider = dependencyProvider.createTokenProvider(provider) ?: return null
+    // null if nothing usable is linked for this provider, including a WebDAV server URL
+    // WebDavRemoteBackup rejects.
+    private suspend fun buildRemoteBackup(provider: RemoteBackupProvider): RemoteBackup? {
         val rootFolderPath = dependencyProvider.rootFolderPath()
         return when (provider) {
-            RemoteBackupProvider.Google -> GoogleDriveRemoteBackup(tokenProvider, rootFolderPath)
-            RemoteBackupProvider.Dropbox -> DropboxRemoteBackup(tokenProvider, rootFolderPath)
+            RemoteBackupProvider.Google -> dependencyProvider.createOAuthConnection(provider)
+                ?.let { GoogleDriveRemoteBackup(it.tokenProvider, rootFolderPath) }
+
+            RemoteBackupProvider.Dropbox -> dependencyProvider.createOAuthConnection(provider)
+                ?.let { DropboxRemoteBackup(it.tokenProvider, rootFolderPath) }
+
+            RemoteBackupProvider.WebDav -> dependencyProvider.createWebDavConnection()?.let {
+                try {
+                    WebDavRemoteBackup(it.serverUrl, it.credentials, rootFolderPath, allowInsecureHttp = it.allowInsecureHttp)
+                } catch (e: IllegalArgumentException) {
+                    null
+                }
+            }
+
             RemoteBackupProvider.OneDrive -> null // no RemoteBackup implementation yet
             RemoteBackupProvider.Custom -> dependencyProvider.buildCustomRemoteBackup(
-                tokenProvider,
-                rootFolderPath
+                dependencyProvider.createUnspecifiedConnection(provider),
+                rootFolderPath,
             )
         }
     }

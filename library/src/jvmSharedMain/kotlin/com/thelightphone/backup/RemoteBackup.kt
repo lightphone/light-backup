@@ -16,7 +16,7 @@ import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
 
 enum class RemoteBackupProvider {
-    Custom, Google, Dropbox, OneDrive
+    Custom, Google, Dropbox, OneDrive, WebDav
 }
 
 // Name of the subfolder inside each backed-up path's own folder (rootFolderPath/<label>/_meta)
