@@ -67,6 +67,7 @@ kotlin {
         jvmSharedTest.dependencies {
             implementation(libs.kotlin.test)
             implementation(libs.kotlin.testJunit)
+            implementation(libs.ktor.clientMock)
         }
 
         androidMain.dependencies {

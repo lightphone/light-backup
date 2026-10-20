@@ -72,13 +72,16 @@ private data class DriveErrorEnvelope(val error: DriveErrorBody? = null)
 // Requires an HttpClient with redirect-following disabled - resumable uploads rely on Drive's
 // (nonstandard) use of HTTP 308 as an "upload not finished yet" signal rather than a real
 // redirect, and a client that auto-follows 308s will misinterpret it.
+// What GoogleDriveRemoteBackup expects its httpClient to be configured like.
+fun googleDriveHttpClient(): HttpClient = HttpClient(CIO) {
+    followRedirects = false
+    expectSuccess = false
+}
+
 class GoogleDriveRemoteBackup(
     private val tokenProvider: RemoteAccessTokenProvider,
     override val rootFolderPath: String,
-    private val httpClient: HttpClient = HttpClient(CIO) {
-        followRedirects = false
-        expectSuccess = false
-    },
+    private val httpClient: HttpClient = googleDriveHttpClient(),
     private val maxRetries: Int = 5,
     // Must be a multiple of 256 KiB per Drive's resumable upload requirements (the final chunk of
     // a file is exempt from that rule).
