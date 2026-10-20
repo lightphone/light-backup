@@ -26,6 +26,7 @@ ktor-clientCore = { module = "io.ktor:ktor-client-core", version.ref = "ktor" }
 ktor-clientCio = { module = "io.ktor:ktor-client-cio", version.ref = "ktor" }
 ktor-clientWebsockets = { module = "io.ktor:ktor-client-websockets", version.ref = "ktor" }
 ktor-clientAuth = { module = "io.ktor:ktor-client-auth", version.ref = "ktor" }
+ktor-clientMock = { module = "io.ktor:ktor-client-mock", version.ref = "ktor" }
 dav4jvm = { module = "com.github.bitfireAT:dav4jvm", version.ref = "dav4jvm" }
 xpp3 = { module = "org.ogce:xpp3", version.ref = "xpp3" }
 androidx-work-runtime = { module = "androidx.work:work-runtime-ktx", version.ref = "androidxWork" }

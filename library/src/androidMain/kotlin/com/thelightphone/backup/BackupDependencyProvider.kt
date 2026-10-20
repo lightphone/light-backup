@@ -1,5 +1,7 @@
 package com.thelightphone.backup
 
+import kotlin.time.Instant
+
 // Everything BackupWorker needs to actually run a backup, beyond the user-facing settings in
 // BackupPreferences.
 interface BackupDependencyProvider {
@@ -21,4 +23,8 @@ interface BackupDependencyProvider {
 
     // connection is whatever createUnspecifiedConnection() returned.
     fun buildCustomRemoteBackup(connection: RemoteConnection?, rootFolderPath: String): RemoteBackup? = null
+
+    // Called once at the end of every backup run that reached its remote
+    // for metrics tracking
+    fun onBackupRunTraffic(traffic: BackupTraffic, startedAt: Instant, finishedAt: Instant) {}
 }

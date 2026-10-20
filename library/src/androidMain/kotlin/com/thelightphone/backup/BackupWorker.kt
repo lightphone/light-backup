@@ -20,6 +20,8 @@ import androidx.work.WorkManager
 import androidx.work.WorkerFactory
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.cio.CIO
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
@@ -42,7 +44,9 @@ class BackupWorker(
     override suspend fun doWork(): Result {
         preferences.getEnabled() ?: return Result.success()
         val provider = preferences.getActiveProvider() ?: return Result.success()
-        val remoteBackup = buildRemoteBackup(provider) ?: return Result.failure()
+        val trafficCounter = BackupTrafficCounter()
+        val remoteBackup = buildRemoteBackup(provider, trafficCounter) ?: return Result.failure()
+        val startedAt = clock.now()
 
         ensureNotificationChannel()
         setForeground(buildForegroundInfo())
@@ -80,6 +84,8 @@ class BackupWorker(
         } catch (e: Exception) {
             preferences.setLastBackupStatus(BackupStatus.Failed(e.message ?: "backup failed", clock.now()))
             Result.retry()
+        } finally {
+            dependencyProvider.onBackupRunTraffic(trafficCounter.snapshot(), startedAt, clock.now())
         }
     }
 
@@ -120,18 +126,40 @@ class BackupWorker(
 
     // null if nothing usable is linked for this provider, including a WebDAV server URL
     // WebDavRemoteBackup rejects.
-    private suspend fun buildRemoteBackup(provider: RemoteBackupProvider): RemoteBackup? {
+    // Built-in remotes get HTTP clients that count their traffic into trafficCounter.
+    private suspend fun buildRemoteBackup(
+        provider: RemoteBackupProvider,
+        trafficCounter: BackupTrafficCounter,
+    ): RemoteBackup? {
         val rootFolderPath = dependencyProvider.rootFolderPath()
         return when (provider) {
             RemoteBackupProvider.Google -> dependencyProvider.createOAuthConnection(provider)
-                ?.let { GoogleDriveRemoteBackup(it.tokenProvider, rootFolderPath) }
+                ?.let {
+                    GoogleDriveRemoteBackup(
+                        it.tokenProvider,
+                        rootFolderPath,
+                        httpClient = googleDriveHttpClient().countingTraffic(trafficCounter),
+                    )
+                }
 
             RemoteBackupProvider.Dropbox -> dependencyProvider.createOAuthConnection(provider)
-                ?.let { DropboxRemoteBackup(it.tokenProvider, rootFolderPath) }
+                ?.let {
+                    DropboxRemoteBackup(
+                        it.tokenProvider,
+                        rootFolderPath,
+                        httpClient = HttpClient(CIO).countingTraffic(trafficCounter),
+                    )
+                }
 
             RemoteBackupProvider.WebDav -> dependencyProvider.createWebDavConnection()?.let {
                 try {
-                    WebDavRemoteBackup(it.serverUrl, it.credentials, rootFolderPath, allowInsecureHttp = it.allowInsecureHttp)
+                    WebDavRemoteBackup(
+                        it.serverUrl,
+                        it.credentials,
+                        rootFolderPath,
+                        httpClient = HttpClient(CIO).countingTraffic(trafficCounter),
+                        allowInsecureHttp = it.allowInsecureHttp,
+                    )
                 } catch (e: IllegalArgumentException) {
                     null
                 }
