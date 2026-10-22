@@ -77,8 +77,12 @@ abstract class BackupRunnerContractTest {
         val paths = listOf(BackupPath("com.example", Path("dir1"), "dir1"))
         val dataSource =
             FakeBackupDataSource(paths, filesPerPath = 3, failingFile = "dir1-file2.txt")
-        val runner =
-            BackupRunner(remoteBackup, dataSource, earliestBackupTimeBeforeBuffer = Duration.ZERO)
+        val runner = BackupRunner(
+            remoteBackup,
+            dataSource,
+            earliestBackupTimeBeforeBuffer = Duration.ZERO,
+            retryDelay = Duration.ZERO,
+        )
 
         val result = runner.run()
 
@@ -95,20 +99,84 @@ abstract class BackupRunnerContractTest {
         assertTrue("dir1-file3.txt" in files)
         assertTrue("dir1-file2.txt" !in files)
 
-        // dir1 still made partial progress (2 of 3 files), so it must be credited in its own
-        // _meta folder - otherwise a retry would re-upload dir1-file1.txt and dir1-file3.txt from
-        // scratch.
-        val dir1MetaFiles = remoteBackup
-            .listFiles(Path(Path(remoteBackup.rootFolderPath, "dir1"), META_FOLDER_NAME))
-            .getOrElse { if (it is RemoteBackupError.NotFound) emptyList() else throw it }
-        assertEquals(
-            1,
-            dir1MetaFiles.size,
-            "expected exactly one dir1/_meta entry, got $dir1MetaFiles"
+        // Not marked complete - otherwise dir1-file2.txt would never be retried.
+        val mostRecent = remoteBackup.getMostRecentBackupDates().getOrThrow()
+        assertTrue("dir1" !in mostRecent, "expected dir1's resumeFrom to not have advanced")
+    }
+
+    @Test
+    fun run_withAFileThatFailsOnlyOnce_recoversItViaTheRetry() = runBlocking {
+        val paths = listOf(BackupPath("com.example", Path("dir1"), "dir1"))
+        val dataSource =
+            FakeBackupDataSource(paths, filesPerPath = 3, failingFile = "dir1-file2.txt", failingFileAttempts = 1)
+        val runner = BackupRunner(
+            remoteBackup,
+            dataSource,
+            earliestBackupTimeBeforeBuffer = Duration.ZERO,
+            retryDelay = Duration.ZERO,
         )
 
-        val mostRecent = remoteBackup.getMostRecentBackupDates().getOrThrow()
-        assertNotNull(mostRecent["dir1"])
+        val result = runner.run()
+
+        assertIs<BackupResult.Completed>(result)
+        assertEquals(3, result.filesBackedUp)
+        assertNotNull(remoteBackup.getMostRecentBackupDates().getOrThrow()["dir1"])
+        Unit
+    }
+
+    @Test
+    fun run_withAFailedFileInAnEarlierWindow_doesNotLetALaterWindowSkipPastIt() = runBlocking {
+        val start = Clock.System.now()
+        val clock = FakeClock(start + 2.hours)
+        val failingFile = "dir1-${(start + 1.hours).epochSeconds}.txt"
+        fun dataSource(failingFile: String?) = FakeBackupDataSource(
+            paths = listOf(BackupPath("com.example", Path("dir1"), "dir1")),
+            earliestPossibleBackupDate = start,
+            filesForWindow = { label, _, upperBound -> Result.success(listOf("$label-${upperBound.epochSeconds}.txt")) },
+            failingFile = failingFile,
+        )
+        fun runner(dataSource: BackupDataSource) = BackupRunner(
+            remoteBackup, dataSource, clock, chunkDuration = 1.hours,
+            earliestBackupTimeBeforeBuffer = Duration.ZERO, retryDelay = Duration.ZERO,
+        )
+
+        val firstResult = runner(dataSource(failingFile)).run()
+        assertIs<BackupResult.Partial>(firstResult)
+        assertEquals(1, firstResult.filesBackedUp, "expected the second window to still upload")
+        assertTrue(
+            "dir1" !in remoteBackup.getMostRecentBackupDates().getOrThrow(),
+            "expected the second window's success not to advance resumeFrom past the first's gap",
+        )
+
+        // Once the file is readable again, both windows are redone.
+        val secondResult = runner(dataSource(failingFile = null)).run()
+        assertIs<BackupResult.Completed>(secondResult)
+        assertEquals(2, secondResult.filesBackedUp)
+        val firstWindowFiles = remoteBackup
+            .listFiles(Path(Path(remoteBackup.rootFolderPath, "dir1"), backupDirectoryNameFor(start + 1.hours)))
+            .getOrThrow()
+        assertTrue(failingFile in firstWindowFiles)
+    }
+
+    @Test
+    fun run_withAFailedFileOlderThanMaxGapAge_givesUpOnItAndAdvancesAnyway() = runBlocking {
+        val paths = listOf(BackupPath("com.example", Path("dir1"), "dir1"))
+        val dataSource =
+            FakeBackupDataSource(paths, filesPerPath = 3, failingFile = "dir1-file2.txt")
+        val runner = BackupRunner(
+            remoteBackup,
+            dataSource,
+            earliestBackupTimeBeforeBuffer = Duration.ZERO,
+            retryDelay = Duration.ZERO,
+            maxGapAge = Duration.ZERO,
+        )
+
+        val result = runner.run()
+
+        assertIs<BackupResult.Partial>(result)
+        assertEquals(2, result.filesBackedUp)
+        assertEquals(FailureScope.File("dir1", "dir1-file2.txt"), result.failures.single().scope)
+        assertNotNull(remoteBackup.getMostRecentBackupDates().getOrThrow()["dir1"])
         Unit
     }
 
@@ -572,7 +640,7 @@ abstract class BackupRunnerContractTest {
         }
 
     @Test
-    fun run_whenAWindowReportsMoreFilesThanTheCap_uploadsTheCapAndDoesNotMarkTheWindowComplete() =
+    fun run_whenAWindowReportsMoreFilesThanTheCap_uploadsTheCapAndSkipsTheRest() =
         runBlocking {
             val paths = listOf(BackupPath("com.example", Path("dir1"), "dir1"))
             val dataSource = FakeBackupDataSource(paths, filesPerPath = 5)
@@ -593,18 +661,11 @@ abstract class BackupRunnerContractTest {
             )
             assertEquals(FailureScope.Path("dir1"), result.failures.single().scope)
 
-            // Not marked complete - no _meta entry, so a retry won't skip past the untouched remainder.
-            val dir1MetaFiles = remoteBackup
-                .listFiles(Path(Path(remoteBackup.rootFolderPath, "dir1"), META_FOLDER_NAME))
-                .getOrElse { if (it is RemoteBackupError.NotFound) emptyList() else throw it }
-            assertEquals(
-                0,
-                dir1MetaFiles.size,
-                "expected no _meta entry since the window wasn't fully drained"
-            )
-
+            // Still marked complete - retrying would only re-list the same over-cap window, so the
+            // remainder is skipped rather than holding dir1 back.
             val mostRecent = remoteBackup.getMostRecentBackupDates().getOrThrow()
-            assertTrue("dir1" !in mostRecent, "expected dir1's resumeFrom to not have advanced")
+            assertNotNull(mostRecent["dir1"], "expected dir1's resumeFrom to advance past the truncated window")
+            Unit
         }
 
     @Test
@@ -643,6 +704,8 @@ private class FakeBackupDataSource(
     private val paths: List<BackupPath>,
     private val filesPerPath: Int = 3,
     private val failingFile: String? = null,
+    // How many reads of failingFile fail before it starts succeeding - unlimited by default.
+    private val failingFileAttempts: Int = Int.MAX_VALUE,
     // Labels that should report nothing left to back up, regardless of filesPerPath.
     private val emptyLabels: Set<String> = emptySet(),
     private val earliestPossibleBackupDate: Instant = Clock.System.now() - 1.hours,
@@ -651,6 +714,8 @@ private class FakeBackupDataSource(
     // Simulates a hung/slow client implementation - see dataSourceTimeout.
     private val getFilesToBackUpForPathDelay: Duration? = null,
 ) : BackupDataSource {
+    private var failedReads = 0
+
     override suspend fun getPathsToBackUp(): Result<List<BackupPath>> = Result.success(paths)
 
     override suspend fun getFilesToBackUpForPath(
@@ -671,7 +736,7 @@ private class FakeBackupDataSource(
     }
 
     override suspend fun readFile(path: Path): Result<InputStream> {
-        if (path.name == failingFile) {
+        if (path.name == failingFile && failedReads++ < failingFileAttempts) {
             return Result.failure(IOException("simulated local read failure for ${path.name}"))
         }
         return Result.success(contentFor(path.name).byteInputStream())
