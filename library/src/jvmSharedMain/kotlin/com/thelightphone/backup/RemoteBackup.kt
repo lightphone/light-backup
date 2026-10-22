@@ -1,5 +1,6 @@
 package com.thelightphone.backup
 
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.io.files.Path
 import kotlinx.serialization.Serializable
@@ -156,7 +157,13 @@ class BackupRunner(
     // when a source returns the time of earliest file to be backed up
     // (in the cae where no backup has ever happened for that source)
     // buffer some time before that timestamp so it doesn't get skipped
-    private val earliestBackupTimeBeforeBuffer: Duration = 1.days
+    private val earliestBackupTimeBeforeBuffer: Duration = 1.days,
+    // How long to wait before retrying a file whose read/upload failed non-fatally (once)
+    private val retryDelay: Duration = 5.seconds,
+    // A file that still fails after its retry leaves a gap that holds back its path's _meta entries
+    // (so the next run retries it). This window limits the number of days those windows are retried
+    // so one bogus file can't hold back the entire backup
+    private val maxGapAge: Duration = 2.days,
 ) {
     // One path's plan for this run: which windows (see chunkWindows) it still needs to catch up
     // on. Computed for every path upfront so the total window count is known before any uploading
@@ -169,6 +176,19 @@ class BackupRunner(
     private suspend fun <T> dataSourceCall(block: suspend () -> Result<T>): Result<T> =
         withTimeoutOrNull(dataSourceTimeout) { block() }
             ?: Result.failure(TimeoutException("dataSource call did not complete within $dataSourceTimeout"))
+
+    // Retried as a pair, since uploadFile consumes the stream readFile returned.
+    private suspend fun backUpFile(remoteDirectory: Path, file: Path): Result<Unit> {
+        suspend fun attempt(): Result<Unit> {
+            val data = dataSourceCall { dataSource.readFile(file) }.getOrElse { return Result.failure(it) }
+            return data.use { remoteBackup.uploadFile(remoteDirectory, file.name, it) }
+        }
+        val first = attempt()
+        val error = first.exceptionOrNull() ?: return first
+        if (error.isFatalToBackupRun()) return first
+        delay(retryDelay)
+        return attempt()
+    }
 
     suspend fun run(): BackupResult {
         // structure in backup root in cloud is
@@ -216,7 +236,16 @@ class BackupRunner(
         onProgress(BackupProgress(windowsCompleted, totalWindows))
 
         for ((path, windows) in plans) {
+            // Set once any file in this path is left un-uploaded. Won't block the rest of the uploads,
+            // but will cause a retry next time anyways. Might lead to redundant uploads, but better
+            // safe than sorry
+            var pathHasGap = false
             for (window in windows) {
+                val gapIsRetryable = window.upperBound > now - maxGapAge
+                fun recordGap() {
+                    if (gapIsRetryable) pathHasGap = true
+                }
+
                 // finally (rather than one increment per exit point below) so every way of
                 // leaving this window's body - continuing past it, or returning to abort the run
                 // - still advances/reports progress exactly once.
@@ -228,14 +257,12 @@ class BackupRunner(
                     }.getOrElse {
                         // Local listing failures are never fatal to the run (see isFatalToBackupRun)
                         failures += BackupFailure(FailureScope.Path(path.label), it)
+                        recordGap()
                         continue
                     }
 
                     if (reportedFiles.isEmpty()) continue
 
-                    // A window whose true count exceeds the cap is never marked complete (see the
-                    // meta-entry check below) - the untouched remainder is retried, not dropped, on
-                    // the next run.
                     val truncated = reportedFiles.size > maxFilesPerWindow
                     val files = if (truncated) reportedFiles.take(maxFilesPerWindow) else reportedFiles
                     if (truncated) {
@@ -243,7 +270,7 @@ class BackupRunner(
                             FailureScope.Path(path.label),
                             IllegalStateException(
                                 "window reported ${reportedFiles.size} files, exceeding the cap of " +
-                                    "$maxFilesPerWindow; uploading the first $maxFilesPerWindow and retrying the rest next run",
+                                    "$maxFilesPerWindow; uploading the first $maxFilesPerWindow and skipping the rest",
                             ),
                         )
                     }
@@ -253,9 +280,10 @@ class BackupRunner(
                     remoteBackup.createDirectory(windowRemotePath).exceptionOrNull()?.let { cause ->
                         val failure = BackupFailure(FailureScope.Path(path.label), cause)
                         if (cause.isFatalToBackupRun()) {
-                            return abort(filesBackedUp, failures, path.label, directoryName, 0, window.upperBound, failure)
+                            return abort(filesBackedUp, failures, failure)
                         }
                         failures += failure
+                        recordGap()
                         continue
                     }
 
@@ -263,20 +291,14 @@ class BackupRunner(
                     var windowFilesBackedUp = 0
 
                     for (file in files) {
-                        val data = dataSourceCall { dataSource.readFile(file) }.getOrElse {
-                            failures += BackupFailure(FailureScope.File(path.label, file.name), it)
-                            continue
-                        }
-                        val uploadError = remoteBackup.uploadFile(windowRemotePath, file.name, data).exceptionOrNull()
-                        if (uploadError != null) {
-                            val failure = BackupFailure(FailureScope.File(path.label, file.name), uploadError)
-                            if (uploadError.isFatalToBackupRun()) {
-                                return abort(
-                                    filesBackedUp, failures, path.label, directoryName,
-                                    windowFilesBackedUp, window.upperBound, failure,
-                                )
+                        val fileError = backUpFile(windowRemotePath, file).exceptionOrNull()
+                        if (fileError != null) {
+                            val failure = BackupFailure(FailureScope.File(path.label, file.name), fileError)
+                            if (fileError.isFatalToBackupRun()) {
+                                return abort(filesBackedUp, failures, failure)
                             }
                             failures += failure
+                            recordGap()
                             continue
                         }
                         filesBackedUp++
@@ -298,18 +320,15 @@ class BackupRunner(
                         if (manifestError != null) {
                             val failure = BackupFailure(FailureScope.Path(path.label), manifestError)
                             if (manifestError.isFatalToBackupRun()) {
-                                return abort(
-                                    filesBackedUp, failures, path.label, directoryName,
-                                    windowFilesBackedUp, window.upperBound, failure,
-                                )
+                                return abort(filesBackedUp, failures, failure)
                             }
                             failures += failure
                         }
                     }
 
-                    // Not written if truncated - this window isn't actually done, so resumeFrom
-                    // must not advance past it (see the truncation check above).
-                    if (windowFilesBackedUp > 0 && !truncated) {
+                    // Not written while this path has a gap (see pathHasGap) - resumeFrom must not
+                    // advance past it. This path will be retried in the next backup run.
+                    if (windowFilesBackedUp > 0 && !pathHasGap) {
                         writeMetaEntry(path.label, directoryName, windowFilesBackedUp, window.upperBound).exceptionOrNull()?.let {
                             failures += BackupFailure(FailureScope.Path(path.label), it)
                         }
@@ -342,20 +361,12 @@ class BackupRunner(
         return remoteBackup.uploadFile(metaDirectory, metaFileNameFor(completedAt), summary.inputStream())
     }
 
-    private suspend fun abort(
+    // The in-progress window gets no _meta entry - it wasn't finished, so the next run redoes it.
+    private fun abort(
         filesBackedUp: Int,
-        failures: MutableList<BackupFailure>,
-        inProgressLabel: String,
-        directoryName: String,
-        inProgressWindowFilesBackedUp: Int,
-        completedAt: Instant,
+        failures: List<BackupFailure>,
         abortedBy: BackupFailure,
     ): BackupResult {
-        if (inProgressWindowFilesBackedUp > 0) {
-            writeMetaEntry(inProgressLabel, directoryName, inProgressWindowFilesBackedUp, completedAt).exceptionOrNull()?.let {
-                failures += BackupFailure(FailureScope.Path(inProgressLabel), it)
-            }
-        }
         return if (filesBackedUp == 0 && failures.isEmpty()) {
             BackupResult.Failed(abortedBy)
         } else {
